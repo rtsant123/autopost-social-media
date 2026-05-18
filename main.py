@@ -195,9 +195,11 @@ def post_via_buffer(image_url, caption, channel_id):
     query = """
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
-        post {
-          id
-          status
+        ... on PostActionSuccess {
+          post {
+            id
+            status
+          }
         }
       }
     }
