@@ -1,5 +1,6 @@
 replicate==0.34.1
 cloudinary==1.41.0
-anthropic==0.28.0
+anthropic==0.49.0
 requests==2.32.3
 Pillow==10.3.0
+httpx==0.27.0
