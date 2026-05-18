@@ -16,8 +16,8 @@ REPLICATE_API_TOKEN = os.environ["REPLICATE_API_TOKEN"]
 CLOUDINARY_CLOUD    = os.environ["CLOUDINARY_CLOUD"]
 CLOUDINARY_KEY      = os.environ["CLOUDINARY_API_KEY"]
 CLOUDINARY_SECRET   = os.environ["CLOUDINARY_SECRET"]
-IG_USER_ID          = os.environ["IG_USER_ID"]
-IG_ACCESS_TOKEN     = os.environ["IG_ACCESS_TOKEN"]
+FB_PAGE_ID          = os.environ["FB_PAGE_ID"]
+FB_ACCESS_TOKEN     = os.environ["FB_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
 LOGO_URL            = os.environ.get("LOGO_URL", "")
 
@@ -95,11 +95,11 @@ def generate_caption_and_prompt(topic):
                     f"specializing in SEO, WordPress, and social media growth.\n\n"
                     f"Topic: {topic}\n\n"
                     f"Return pure JSON only (no markdown, no explanation) with these keys:\n"
-                    f"1. caption: 2-3 engaging lines for Instagram\n"
+                    f"1. caption: 2-3 engaging lines for Facebook post\n"
                     f"2. image_prompt: detailed prompt for AI image. Style: professional "
                     f"infographic, dark navy blue background, white and gold text, clean modern "
                     f"design, bold typography, no people, no faces, business/tech visual\n"
-                    f"3. hashtags: 20 relevant hashtags as single string\n\n"
+                    f"3. hashtags: 15 relevant hashtags as single string\n\n"
                     f"Pure JSON only."
                 )
             }
@@ -134,8 +134,8 @@ def add_watermark(image_bytes):
 
     if LOGO_URL:
         try:
-            logo_data = requests.get(LOGO_URL).content
-            logo = Image.open(BytesIO(logo_data)).convert("RGBA")
+            logo_resp = requests.get(LOGO_URL, timeout=10)
+            logo = Image.open(BytesIO(logo_resp.content)).convert("RGBA")
             logo_w = int(img.width * 0.15)
             ratio = logo_w / logo.width
             logo_h = int(logo.height * ratio)
@@ -149,9 +149,9 @@ def add_watermark(image_bytes):
             print("Logo added")
         except Exception as e:
             print(f"Logo failed, using text: {e}")
-            img = _add_text_watermark(img)
+            img = add_text_watermark(img)
     else:
-        img = _add_text_watermark(img)
+        img = add_text_watermark(img)
 
     final = Image.new("RGB", img.size, (255, 255, 255))
     final.paste(img, mask=img.split()[3])
@@ -160,7 +160,7 @@ def add_watermark(image_bytes):
     return out.getvalue()
 
 
-def _add_text_watermark(img):
+def add_text_watermark(img):
     draw = ImageDraw.Draw(img)
     text = "gundrux.in"
     font_size = int(img.width * 0.032)
@@ -182,42 +182,31 @@ def upload_to_cloudinary(image_bytes, topic):
     slug = topic[:25].replace(" ", "_").replace("/", "-")
     result = cloudinary.uploader.upload(
         image_bytes,
-        folder="instagram_posts",
+        folder="facebook_posts",
         public_id=f"{date.today()}_{slug}",
         resource_type="image"
     )
     return result["secure_url"]
 
 
-def post_to_instagram(image_url, caption):
-    create = requests.post(
-        f"https://graph.facebook.com/v19.0/{IG_USER_ID}/media",
+def post_to_facebook(image_url, caption):
+    result = requests.post(
+        f"https://graph.facebook.com/v19.0/{FB_PAGE_ID}/photos",
         data={
-            "image_url": image_url,
-            "caption": caption,
-            "access_token": IG_ACCESS_TOKEN
+            "url": image_url,
+            "message": caption,
+            "access_token": FB_ACCESS_TOKEN
         }
     ).json()
-    print(f"Container: {create}")
-
-    if "id" not in create:
-        raise Exception(f"Container failed: {create}")
-
-    time.sleep(8)
-
-    publish = requests.post(
-        f"https://graph.facebook.com/v19.0/{IG_USER_ID}/media_publish",
-        data={
-            "creation_id": create["id"],
-            "access_token": IG_ACCESS_TOKEN
-        }
-    ).json()
-    print(f"Published: {publish}")
-    return publish
+    print(f"Facebook result: {result}")
+    if "id" not in result:
+        raise Exception(f"Failed: {result}")
+    return result
 
 
 def run_single_post(topic):
     print(f"\nTopic: {topic}")
+
     print("Generating caption + image prompt (Claude Haiku)...")
     content = generate_caption_and_prompt(topic)
     caption = f"{content['caption']}\n\n{content['hashtags']}"
@@ -230,9 +219,10 @@ def run_single_post(topic):
 
     print("Uploading to Cloudinary...")
     url = upload_to_cloudinary(image_bytes, topic)
+    print(f"Image URL: {url}")
 
-    print("Posting to Instagram...")
-    result = post_to_instagram(url, caption)
+    print("Posting to Facebook...")
+    result = post_to_facebook(url, caption)
     print(f"Done: {result}")
 
 
