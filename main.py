@@ -16,19 +16,22 @@ REPLICATE_API_TOKEN = os.environ["REPLICATE_API_TOKEN"]
 CLOUDINARY_CLOUD    = os.environ["CLOUDINARY_CLOUD"]
 CLOUDINARY_KEY      = os.environ["CLOUDINARY_API_KEY"]
 CLOUDINARY_SECRET   = os.environ["CLOUDINARY_SECRET"]
-FB_PAGE_ID          = os.environ["FB_PAGE_ID"]
-FB_ACCESS_TOKEN     = os.environ["FB_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
+BUFFER_TOKEN        = os.environ["BUFFER_TOKEN"]
 LOGO_URL            = os.environ.get("LOGO_URL", "")
 
-# CLOUDINARY SETUP
+# Buffer IDs - hardcoded from your account
+BUFFER_FB_CHANNEL   = "6a0b3f9e090476fb9932d776"   # Facebook - Gundrux
+BUFFER_IG_CHANNEL   = "6a0b4005090476fb9932d92e"   # Instagram - gundrux.in
+
+# Cloudinary setup
 cloudinary.config(
     cloud_name=CLOUDINARY_CLOUD,
     api_key=CLOUDINARY_KEY,
     api_secret=CLOUDINARY_SECRET
 )
 
-# DEFAULT TOPICS
+# Default topics
 DEFAULT_TOPICS = [
     "SEO tips for small businesses in 2025",
     "WordPress speed optimization guide",
@@ -95,7 +98,7 @@ def generate_caption_and_prompt(topic):
                     f"specializing in SEO, WordPress, and social media growth.\n\n"
                     f"Topic: {topic}\n\n"
                     f"Return pure JSON only (no markdown, no explanation) with these keys:\n"
-                    f"1. caption: 2-3 engaging lines for Facebook post\n"
+                    f"1. caption: 2-3 engaging lines in English for social media post\n"
                     f"2. image_prompt: detailed prompt for AI image. Style: professional "
                     f"infographic, dark navy blue background, white and gold text, clean modern "
                     f"design, bold typography, no people, no faces, business/tech visual\n"
@@ -131,7 +134,6 @@ def generate_image(image_prompt):
 
 def add_watermark(image_bytes):
     img = Image.open(BytesIO(image_bytes)).convert("RGBA")
-
     if LOGO_URL:
         try:
             logo_resp = requests.get(LOGO_URL, timeout=10)
@@ -182,26 +184,49 @@ def upload_to_cloudinary(image_bytes, topic):
     slug = topic[:25].replace(" ", "_").replace("/", "-")
     result = cloudinary.uploader.upload(
         image_bytes,
-        folder="facebook_posts",
+        folder="social_posts",
         public_id=f"{date.today()}_{slug}",
         resource_type="image"
     )
     return result["secure_url"]
 
 
-def post_to_facebook(image_url, caption):
-    result = requests.post(
-        f"https://graph.facebook.com/v19.0/{FB_PAGE_ID}/photos",
-        data={
-            "url": image_url,
-            "message": caption,
-            "access_token": FB_ACCESS_TOKEN
+def post_via_buffer(image_url, caption, channel_id):
+    query = """
+    mutation CreatePost($input: CreatePostInput!) {
+      createPost(input: $input) {
+        ... on Post {
+          id
+          status
         }
-    ).json()
-    print(f"Facebook result: {result}")
-    if "id" not in result:
-        raise Exception(f"Failed: {result}")
-    return result
+        ... on CoreAPIError {
+          message
+          code
+        }
+      }
+    }
+    """
+    variables = {
+        "input": {
+            "channelId": channel_id,
+            "content": {
+                "text": caption,
+                "media": [{"url": image_url, "type": "IMAGE"}]
+            },
+            "publishing": {
+                "publishingType": "PUBLISH_NOW"
+            }
+        }
+    }
+    resp = requests.post(
+        "https://api.buffer.com/graphql",
+        json={"query": query, "variables": variables},
+        headers={
+            "Authorization": f"Bearer {BUFFER_TOKEN}",
+            "Content-Type": "application/json"
+        }
+    )
+    return resp.json()
 
 
 def run_single_post(topic):
@@ -221,9 +246,13 @@ def run_single_post(topic):
     url = upload_to_cloudinary(image_bytes, topic)
     print(f"Image URL: {url}")
 
-    print("Posting to Facebook...")
-    result = post_to_facebook(url, caption)
-    print(f"Done: {result}")
+    print("Posting to Facebook via Buffer...")
+    fb_result = post_via_buffer(url, caption, BUFFER_FB_CHANNEL)
+    print(f"Facebook: {fb_result}")
+
+    print("Posting to Instagram via Buffer...")
+    ig_result = post_via_buffer(url, caption, BUFFER_IG_CHANNEL)
+    print(f"Instagram: {ig_result}")
 
 
 def run_daily_posts(count=6):
