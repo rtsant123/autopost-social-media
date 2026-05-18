@@ -212,7 +212,7 @@ def post_via_buffer(image_url, caption, channel_id, platform):
     if platform == "facebook":
         metadata = {"facebook": {"type": "post"}}
     elif platform == "instagram":
-        metadata = {"instagram": {"type": "post"}}
+        metadata = {"instagram": {"type": "post", "shouldShareToFeed": True}}
 
     variables = {
         "input": {
