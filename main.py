@@ -201,23 +201,23 @@ def post_via_buffer(image_url, caption, channel_id):
             status
           }
         }
+        ... on MutationError {
+          message
+        }
       }
     }
     """
     variables = {
         "input": {
             "channelId": channel_id,
-            "content": {
-                "text": caption,
-                "media": [{"url": image_url, "type": "IMAGE"}]
-            },
-            "publishing": {
-                "publishingType": "PUBLISH_NOW"
-            }
+            "text": caption,
+            "schedulingType": "automatic",
+            "mode": "addToQueue",
+            "assets": [{"url": image_url, "mediaType": "image"}]
         }
     }
     resp = requests.post(
-        "https://api.buffer.com/graphql",
+        "https://api.buffer.com",
         json={"query": query, "variables": variables},
         headers={
             "Authorization": f"Bearer {BUFFER_TOKEN}",
