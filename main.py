@@ -191,7 +191,7 @@ def upload_to_cloudinary(image_bytes, topic):
     return result["secure_url"]
 
 
-def post_via_buffer(image_url, caption, channel_id):
+def post_via_buffer(image_url, caption, channel_id, platform):
     query = """
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
@@ -207,6 +207,13 @@ def post_via_buffer(image_url, caption, channel_id):
       }
     }
     """
+    # Each platform needs its own metadata with type
+    metadata = {}
+    if platform == "facebook":
+        metadata = {"facebook": {"type": "post"}}
+    elif platform == "instagram":
+        metadata = {"instagram": {"type": "post"}}
+
     variables = {
         "input": {
             "channelId": channel_id,
@@ -214,7 +221,7 @@ def post_via_buffer(image_url, caption, channel_id):
             "schedulingType": "automatic",
             "mode": "addToQueue",
             "assets": [{"image": {"url": image_url}}],
-            "type": "post"
+            "metadata": metadata
         }
     }
     resp = requests.post(
@@ -246,11 +253,11 @@ def run_single_post(topic):
     print(f"Image URL: {url}")
 
     print("Posting to Facebook via Buffer...")
-    fb_result = post_via_buffer(url, caption, BUFFER_FB_CHANNEL)
+    fb_result = post_via_buffer(url, caption, BUFFER_FB_CHANNEL, "facebook")
     print(f"Facebook: {fb_result}")
 
     print("Posting to Instagram via Buffer...")
-    ig_result = post_via_buffer(url, caption, BUFFER_IG_CHANNEL)
+    ig_result = post_via_buffer(url, caption, BUFFER_IG_CHANNEL, "instagram")
     print(f"Instagram: {ig_result}")
 
 
