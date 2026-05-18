@@ -214,7 +214,7 @@ def post_via_buffer(image_url, caption, channel_id):
             "schedulingType": "automatic",
             "mode": "addToQueue",
             "assets": [{"image": {"url": image_url}}],
-            "metadata": {"postType": "post"}
+            "type": "post"
         }
     }
     resp = requests.post(
