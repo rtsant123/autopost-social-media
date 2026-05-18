@@ -195,13 +195,9 @@ def post_via_buffer(image_url, caption, channel_id):
     query = """
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
-        ... on Post {
+        post {
           id
           status
-        }
-        ... on CoreAPIError {
-          message
-          code
         }
       }
     }
