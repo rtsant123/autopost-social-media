@@ -3,15 +3,15 @@ import time
 import json
 import random
 import requests
-import replicate
 import cloudinary
 import cloudinary.uploader
 from datetime import date
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 import anthropic
+from replicate.client import Client as ReplicateClient
 
-# ── CONFIG ──────────────────────────────────────────────
+# CONFIG
 REPLICATE_API_TOKEN = os.environ["REPLICATE_API_TOKEN"]
 CLOUDINARY_CLOUD    = os.environ["CLOUDINARY_CLOUD"]
 CLOUDINARY_KEY      = os.environ["CLOUDINARY_API_KEY"]
@@ -19,16 +19,16 @@ CLOUDINARY_SECRET   = os.environ["CLOUDINARY_SECRET"]
 IG_USER_ID          = os.environ["IG_USER_ID"]
 IG_ACCESS_TOKEN     = os.environ["IG_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
-LOGO_URL            = os.environ.get("LOGO_URL", "")  # set your logo URL in Railway
+LOGO_URL            = os.environ.get("LOGO_URL", "")
 
-# ── CLOUDINARY SETUP ────────────────────────────────────
+# CLOUDINARY SETUP
 cloudinary.config(
     cloud_name=CLOUDINARY_CLOUD,
     api_key=CLOUDINARY_KEY,
     api_secret=CLOUDINARY_SECRET
 )
 
-# ── DEFAULT TOPICS — auto-rotates daily ─────────────────
+# DEFAULT TOPICS
 DEFAULT_TOPICS = [
     "SEO tips for small businesses in 2025",
     "WordPress speed optimization guide",
@@ -62,31 +62,27 @@ DEFAULT_TOPICS = [
     "Video SEO for YouTube and Google",
 ]
 
-# ── ADD YOUR OWN TOPICS ──────────────────────────────────
-# Create a file called custom_topics.txt in the same folder
-# Add one topic per line — they will be included automatically
 CUSTOM_TOPICS_FILE = "custom_topics.txt"
 
 
-def load_topics() -> list:
+def load_topics():
     topics = DEFAULT_TOPICS.copy()
     if os.path.exists(CUSTOM_TOPICS_FILE):
         with open(CUSTOM_TOPICS_FILE, "r") as f:
-            custom = [line.strip() for line in f if line.strip()]
+            custom = [line.strip() for line in f if line.strip() and not line.startswith("#")]
             topics.extend(custom)
             print(f"Loaded {len(custom)} custom topics")
     return topics
 
 
-def get_todays_topics(count: int = 6) -> list:
+def get_todays_topics(count=6):
     topics = load_topics()
     seed = int(date.today().strftime("%Y%m%d"))
     random.seed(seed)
     return random.sample(topics, min(count, len(topics)))
 
 
-# ── CLAUDE HAIKU — CAPTION + IMAGE PROMPT ───────────────
-def generate_caption_and_prompt(topic: str) -> dict:
+def generate_caption_and_prompt(topic):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -95,7 +91,7 @@ def generate_caption_and_prompt(topic: str) -> dict:
             {
                 "role": "user",
                 "content": (
-                    f"You are a social media expert for Gundrux — a digital marketing agency "
+                    f"You are a social media expert for Gundrux, a digital marketing agency "
                     f"specializing in SEO, WordPress, and social media growth.\n\n"
                     f"Topic: {topic}\n\n"
                     f"Return pure JSON only (no markdown, no explanation) with these keys:\n"
@@ -117,9 +113,9 @@ def generate_caption_and_prompt(topic: str) -> dict:
     return json.loads(raw.strip())
 
 
-# ── REPLICATE FLUX — GENERATE IMAGE ─────────────────────
-def generate_image(image_prompt: str) -> bytes:
-    output = replicate.run(
+def generate_image(image_prompt):
+    client = ReplicateClient(api_token=REPLICATE_API_TOKEN)
+    output = client.run(
         "black-forest-labs/flux-schnell",
         input={
             "prompt": image_prompt,
@@ -133,8 +129,7 @@ def generate_image(image_prompt: str) -> bytes:
     return requests.get(image_url).content
 
 
-# ── LOGO / TEXT WATERMARK ────────────────────────────────
-def add_watermark(image_bytes: bytes) -> bytes:
+def add_watermark(image_bytes):
     img = Image.open(BytesIO(image_bytes)).convert("RGBA")
 
     if LOGO_URL:
@@ -145,7 +140,6 @@ def add_watermark(image_bytes: bytes) -> bytes:
             ratio = logo_w / logo.width
             logo_h = int(logo.height * ratio)
             logo = logo.resize((logo_w, logo_h), Image.LANCZOS)
-            # Semi-transparent
             r, g, b, a = logo.split()
             a = a.point(lambda x: int(x * 0.85))
             logo.putalpha(a)
@@ -166,7 +160,7 @@ def add_watermark(image_bytes: bytes) -> bytes:
     return out.getvalue()
 
 
-def _add_text_watermark(img: Image.Image) -> Image.Image:
+def _add_text_watermark(img):
     draw = ImageDraw.Draw(img)
     text = "gundrux.in"
     font_size = int(img.width * 0.032)
@@ -184,8 +178,7 @@ def _add_text_watermark(img: Image.Image) -> Image.Image:
     return img
 
 
-# ── CLOUDINARY UPLOAD ────────────────────────────────────
-def upload_to_cloudinary(image_bytes: bytes, topic: str) -> str:
+def upload_to_cloudinary(image_bytes, topic):
     slug = topic[:25].replace(" ", "_").replace("/", "-")
     result = cloudinary.uploader.upload(
         image_bytes,
@@ -196,8 +189,7 @@ def upload_to_cloudinary(image_bytes: bytes, topic: str) -> str:
     return result["secure_url"]
 
 
-# ── INSTAGRAM POST ───────────────────────────────────────
-def post_to_instagram(image_url: str, caption: str) -> dict:
+def post_to_instagram(image_url, caption):
     create = requests.post(
         f"https://graph.facebook.com/v19.0/{IG_USER_ID}/media",
         data={
@@ -224,34 +216,32 @@ def post_to_instagram(image_url: str, caption: str) -> dict:
     return publish
 
 
-# ── FULL PIPELINE ────────────────────────────────────────
-def run_single_post(topic: str):
-    print(f"\n🚀 Topic: {topic}")
-
-    print("📝 Generating caption + image prompt (Claude Haiku)...")
+def run_single_post(topic):
+    print(f"\nTopic: {topic}")
+    print("Generating caption + image prompt (Claude Haiku)...")
     content = generate_caption_and_prompt(topic)
     caption = f"{content['caption']}\n\n{content['hashtags']}"
 
-    print("🎨 Generating image (Flux)...")
+    print("Generating image (Flux)...")
     image_bytes = generate_image(content["image_prompt"])
 
-    print("🏷️ Adding watermark...")
+    print("Adding watermark...")
     image_bytes = add_watermark(image_bytes)
 
-    print("☁️ Uploading to Cloudinary...")
+    print("Uploading to Cloudinary...")
     url = upload_to_cloudinary(image_bytes, topic)
 
-    print("📸 Posting to Instagram...")
+    print("Posting to Instagram...")
     result = post_to_instagram(url, caption)
-    print(f"✅ Done: {result}")
+    print(f"Done: {result}")
 
 
-def run_daily_posts(count: int = 6):
+def run_daily_posts(count=6):
     topics = get_todays_topics(count)
-    interval = (14 * 3600) // count  # spread over 14 hours
+    interval = (14 * 3600) // count
 
-    print(f"\n📅 Today: {date.today()}")
-    print(f"📋 {count} topics queued:")
+    print(f"\nToday: {date.today()}")
+    print(f"{count} topics queued:")
     for i, t in enumerate(topics):
         print(f"  {i+1}. {t}")
 
@@ -259,14 +249,14 @@ def run_daily_posts(count: int = 6):
         try:
             run_single_post(topic)
         except Exception as e:
-            print(f"❌ Post {i+1} failed: {e}")
+            print(f"Post {i+1} failed: {e}")
 
         if i < len(topics) - 1:
-            mins = interval // 120
-            print(f"\n⏳ Next post in {mins} minutes...")
+            mins = interval // 60
+            print(f"\nNext post in {mins} minutes...")
             time.sleep(interval)
 
-    print("\n🎉 All done for today!")
+    print("\nAll done for today!")
 
 
 if __name__ == "__main__":
