@@ -52,16 +52,32 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ── TELEGRAM HELPERS ─────────────────────────────────────
 def tg_send(text, reply_markup=None):
+    print(f"[telegram] sending text...")
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
-    return requests.post(f"{TELEGRAM_API}/sendMessage", json=data).json()
+    try:
+        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=data, timeout=30)
+        result = resp.json()
+        print(f"[telegram] response: {result.get('ok', False)}")
+        return result
+    except Exception as e:
+        print(f"[telegram] ERROR: {e}")
+        return {"ok": False, "error": str(e)}
 
 def tg_send_photo(image_url, caption, reply_markup=None):
+    print(f"[telegram] sending photo to {TELEGRAM_CHAT_ID}...")
     data = {"chat_id": TELEGRAM_CHAT_ID, "photo": image_url, "caption": caption[:1024], "parse_mode": "HTML"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
-    return requests.post(f"{TELEGRAM_API}/sendPhoto", json=data).json()
+    try:
+        resp = requests.post(f"{TELEGRAM_API}/sendPhoto", json=data, timeout=30)
+        result = resp.json()
+        print(f"[telegram] response: {result}")
+        return result
+    except Exception as e:
+        print(f"[telegram] ERROR: {e}")
+        return {"ok": False, "error": str(e)}
 
 def tg_answer_callback(callback_id, text=""):
     requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": text})
@@ -219,7 +235,7 @@ def template_split_purple(c):
 def template_minimal_neon(c):
     return TEMPLATE_MINIMAL_NEON.format(**c)
 
-TEMPLATES = [template_dark_indigo, template_split_purple, template_minimal_neon]
+TEMPLATES = [template_dark_indigo, template_minimal_neon]
 
 # Template 1: Dark Indigo with icons
 TEMPLATE_DARK_INDIGO = """<!DOCTYPE html><html><head><meta charset="UTF-8">
@@ -401,7 +417,7 @@ def render_image(content_data):
     }
 
     hour = datetime.now().hour
-    template_idx = hour % 3
+    template_idx = hour % len(TEMPLATES)
     template_fn = TEMPLATES[template_idx]
     html = template_fn(data)
     print(f"  [render] template {template_idx+1} selected, html size: {len(html)}")
