@@ -1,5 +1,10 @@
+import sys
 import os
 import time
+
+# Force unbuffered output for Railway logs
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 import json
 import random
 import requests
