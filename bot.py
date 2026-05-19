@@ -95,10 +95,19 @@ def scrape_topics_from(url):
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; Bot)"})
         soup = BeautifulSoup(resp.text, "html.parser")
         titles = []
-        # Try article/h2/h3
         for tag in soup.find_all(["h2", "h3", "h1", "a"]):
             text = tag.get_text(strip=True)
-            if 25 < len(text) < 130 and not text.lower().startswith(("subscribe", "sign up", "log in", "menu")):
+            if not (25 < len(text) < 130):
+                continue
+            if text.lower().startswith(("subscribe", "sign up", "log in", "menu")):
+                continue
+            # Filter out brand/source mentions
+            brands = ["ahrefs", "moz", "semrush", "backlinko", "webdoux", "course by", "| 3.", "| 2.", "| 1.", " by ", "feat.", "ft.", "podcast"]
+            if any(b in text.lower() for b in brands):
+                continue
+            # Clean up
+            text = text.split(" | ")[0].split(" - ")[0].strip()
+            if 20 < len(text) < 100:
                 titles.append(text)
         return titles[:15]
     except Exception as e:
@@ -158,8 +167,22 @@ def pick_topic():
     return random.choice(topics) if topics else random.choice(DEFAULT_TOPICS)
 
 # ── CLAUDE HAIKU ──────────────────────────────────────────
-def generate_content(topic):
+def generate_content(topic, max_retries=4):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    for attempt in range(max_retries):
+        try:
+            return _call_claude(client, topic)
+        except Exception as e:
+            err = str(e)
+            if "overloaded" in err.lower() or "529" in err or "rate" in err.lower():
+                wait = 10 * (attempt + 1)
+                print(f"  Claude overloaded, retry {attempt+1}/{max_retries} in {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
+    raise Exception("Claude API still overloaded after retries")
+
+def _call_claude(client, topic):
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1024,
