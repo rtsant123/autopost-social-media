@@ -362,6 +362,7 @@ body{{width:1080px;height:1080px;overflow:hidden;font-family:'Inter',sans-serif;
 </div></body></html>"""
 
 def render_image(content_data):
+    print("  [render] preparing data...")
     words = content_data["title"].split()
     mid = max(1, len(words) // 2)
     points = content_data["points"]
@@ -376,22 +377,30 @@ def render_image(content_data):
         "p4": points[3], "p5": points[4]
     }
 
-    # Rotate template based on day + time
     hour = datetime.now().hour
     template_idx = hour % 3
     template_fn = TEMPLATES[template_idx]
     html = template_fn(data)
+    print(f"  [render] template {template_idx+1} selected, html size: {len(html)}")
 
     with open("/tmp/post_render.html", "w") as f:
         f.write(html)
+    print("  [render] html saved")
 
+    print("  [render] launching chromium...")
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+        print("  [render] browser launched")
         page = browser.new_page(viewport={"width": 1080, "height": 1080})
-        page.goto("file:///tmp/post_render.html")
-        page.wait_for_timeout(3000)
+        print("  [render] page created, navigating...")
+        page.goto("file:///tmp/post_render.html", timeout=15000)
+        print("  [render] page loaded, waiting 2s for fonts...")
+        page.wait_for_timeout(2000)
+        print("  [render] taking screenshot...")
         img_bytes = page.screenshot(full_page=False)
+        print(f"  [render] screenshot done, {len(img_bytes)} bytes")
         browser.close()
+        print("  [render] browser closed")
     return img_bytes, template_idx
 
 def upload_cloudinary(image_bytes, topic):
@@ -456,10 +465,15 @@ pending = {}  # post_id -> {topic, content, image_url, caption}
 def generate_one_post():
     topic = pick_topic()
     print(f"\nTopic: {topic}")
+    print("[1/4] Calling Claude Haiku...")
     content = generate_content(topic)
+    print(f"[1/4] Done. Title: {content.get('title', '')}")
     caption = f"{content['caption']}\n\n{content['hashtags']}"
+    print("[2/4] Rendering image...")
     image_bytes, tpl_idx = render_image(content)
+    print("[3/4] Uploading to Cloudinary...")
     image_url = upload_cloudinary(image_bytes, topic)
+    print(f"[3/4] Done. URL: {image_url}")
     return {
         "topic": topic,
         "content": content,
