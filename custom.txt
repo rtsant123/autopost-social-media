@@ -1,7 +1,9 @@
-# Add your own topics here — one per line
-# These will be mixed with default topics automatically
-# Example:
+# Add your custom topics here, one per line
+# These will be mixed with scraped blog topics
+# Lines starting with # are ignored
 
-How Gundrux helped a client rank #1 on Google
-5 reasons to hire an SEO agency in 2025
-WordPress website for your local business
+How Gundrux helps brands rank with AI SEO
+5 reasons to choose Gundrux for digital marketing
+WordPress vs custom website what is better for SEO
+How to use ChatGPT for content marketing
+Best AI tools for small business automation
