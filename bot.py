@@ -469,7 +469,7 @@ def post_buffer(image_url, caption, channel_id, platform):
     elif platform == "instagram":
         metadata = {"instagram": {"type": "post", "shouldShareToFeed": True}}
     elif platform == "linkedin":
-        metadata = {"linkedin": {"type": "post"}}
+        metadata = {}  # LinkedIn doesn't need metadata type
 
     variables = {
         "input": {
