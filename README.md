@@ -1,44 +1,47 @@
-# Gundrux Instagram Auto Poster
+# Gundrux Auto-Poster v2
 
-Posts 6 AI-generated images daily to Instagram automatically.
+Posts 3 times daily to Facebook + Instagram + LinkedIn via Buffer.
+Telegram approval before every post.
 
 ## Stack
-- Claude Haiku → captions + image prompts
-- Replicate Flux → image generation (~$0.003/image)
-- Cloudinary → image hosting (free)
-- Meta Graph API → Instagram posting (free)
-- Railway → hosting + cron ($5/month)
+- Claude Haiku → captions + tips
+- HTML/Playwright → image rendering (3 rotating templates)
+- Cloudinary → image hosting
+- Buffer GraphQL API → posts to FB + IG + LinkedIn
+- Telegram → approval flow
+- Railway → hosting + cron
 
-## Railway Environment Variables
+## Features
+- 3 posts daily (9 AM, 1 PM, 6 PM India time)
+- Telegram approval: Approve / Reject / Edit / Regenerate
+- Scrapes 5 blog sources for fresh topics:
+  - webdoux.com/blog
+  - backlinko.com/blog
+  - ahrefs.com/blog
+  - moz.com/blog
+  - semrush.com/blog
+- 3 rotating template designs (Indigo / Purple Split / Neon)
+- History tracking (approved & rejected)
+- Custom topics support
 
-| Variable | Value |
-|---|---|
-| REPLICATE_API_TOKEN | r8_PIGxGEdvRbiLng7Aho5cOzLz8Yg4Ahr39bMN2 |
-| CLOUDINARY_CLOUD | dpibyssay |
-| CLOUDINARY_API_KEY | 541523367679521 |
-| CLOUDINARY_SECRET | 0V7gIESVcHiNmlxyHVXapvDTbXY |
-| IG_USER_ID | 122131959087016967 |
-| IG_ACCESS_TOKEN | your_token_here |
-| ANTHROPIC_API_KEY | your_key_here |
-| LOGO_URL | https://yoursite.com/logo.png (optional) |
+## Railway Variables Required
 
-## Add Your Own Topics
+```
+ANTHROPIC_API_KEY=sk-ant-...
+CLOUDINARY_CLOUD=dpibyssay
+CLOUDINARY_API_KEY=541523367679521
+CLOUDINARY_SECRET=0V7gIESVcHiNmlxyHVXapvDTbXY
+BUFFER_TOKEN=j3XZIo0WAMqTczbl7wbnBEGQKRFprbfPX1Y0JM01vyT
+TELEGRAM_TOKEN=8895110218:AAEYteT6B-lIDWc96fkFwh57cQ7288S0_zw
+TELEGRAM_CHAT_ID=8076792093
+```
 
-Edit `custom_topics.txt` — one topic per line.
-They auto-mix with the 30 default topics.
+## Cron Schedule
+Runs at: 3:30 AM, 7:30 AM, 12:30 PM UTC = 9 AM, 1 PM, 6 PM India
 
-## Logo Watermark
-
-Set `LOGO_URL` in Railway variables to your logo image URL.
-If not set, it will use text watermark `gundrux.in` instead.
-
-## Deploy to Railway
-
-1. Push this folder to GitHub
-2. Railway → New Project → Deploy from GitHub
-3. Add all environment variables
-4. Set cron: `0 6 * * *` (runs 6 AM UTC daily)
-
-## Cost
-
-~$6-7/month total (Railway + Replicate)
+## Files
+- `bot.py` - main script
+- `requirements.txt` - dependencies
+- `railway.toml` - deployment config
+- `custom_topics.txt` - your topics
+- `history.json` - auto-generated post log
