@@ -395,7 +395,8 @@ def render_image(content_data):
     return img_bytes, template_idx
 
 def upload_cloudinary(image_bytes, topic):
-    slug = topic[:25].replace(" ", "_").replace("/", "-")
+    import re
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", topic[:25])
     result = cloudinary.uploader.upload(
         image_bytes,
         folder="social_posts",
