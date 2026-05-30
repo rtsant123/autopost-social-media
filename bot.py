@@ -72,9 +72,46 @@ cloudinary.config(
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+# CHAT_ID is where the bot lives. For a GROUP this is a NEGATIVE number
+# (e.g. -1001234567890). For a 1-on-1 private chat it's your own user id.
+# Set TELEGRAM_CHAT_ID to your group's id. Use /chatid in the group to find it.
+CHAT_ID = TELEGRAM_CHAT_ID
+
+# ── ADMIN AUTHORIZATION ──────────────────────────────────
+_admin_cache = {"ids": set(), "ts": 0}
+
+def get_admin_ids():
+    """Group admins, cached for 5 minutes. Empty for private chats."""
+    now = time.time()
+    if now - _admin_cache["ts"] < 300 and _admin_cache["ids"]:
+        return _admin_cache["ids"]
+    try:
+        resp = requests.get(f"{TELEGRAM_API}/getChatAdministrators",
+                            params={"chat_id": CHAT_ID}, timeout=15).json()
+        ids = {a["user"]["id"] for a in resp.get("result", [])}
+        if ids:
+            _admin_cache["ids"] = ids
+            _admin_cache["ts"] = now
+        return ids
+    except Exception as e:
+        print(f"[admin] fetch failed: {e}")
+        return _admin_cache["ids"]
+
+def is_authorized(user_id, chat_id):
+    """Only act inside the configured chat. In a group, only admins. In a
+    private chat, only the owner (whose id equals the positive CHAT_ID)."""
+    if str(chat_id) != str(CHAT_ID):
+        return False
+    try:
+        if int(CHAT_ID) > 0:                 # private chat
+            return int(user_id) == int(CHAT_ID)
+        return int(user_id) in get_admin_ids()  # group: any admin
+    except Exception:
+        return False
+
 # ── TELEGRAM HELPERS ─────────────────────────────────────
-def tg_send(text, reply_markup=None):
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+def tg_send(text, reply_markup=None, chat_id=None):
+    data = {"chat_id": chat_id or CHAT_ID, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     try:
@@ -83,8 +120,8 @@ def tg_send(text, reply_markup=None):
         print(f"[telegram] send ERROR: {e}")
         return {"ok": False, "error": str(e)}
 
-def tg_send_photo(image_url, caption, reply_markup=None):
-    data = {"chat_id": TELEGRAM_CHAT_ID, "photo": image_url,
+def tg_send_photo(image_url, caption, reply_markup=None, chat_id=None):
+    data = {"chat_id": chat_id or CHAT_ID, "photo": image_url,
             "caption": caption[:1024], "parse_mode": "HTML"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
@@ -94,10 +131,10 @@ def tg_send_photo(image_url, caption, reply_markup=None):
         print(f"[telegram] photo ERROR: {e}")
         return {"ok": False, "error": str(e)}
 
-def tg_send_media_group(image_urls):
+def tg_send_media_group(image_urls, chat_id=None):
     """Send up to 10 images as one swipeable album. No buttons allowed on albums."""
     media = [{"type": "photo", "media": u} for u in image_urls[:10]]
-    data = {"chat_id": TELEGRAM_CHAT_ID, "media": json.dumps(media)}
+    data = {"chat_id": chat_id or CHAT_ID, "media": json.dumps(media)}
     try:
         return requests.post(f"{TELEGRAM_API}/sendMediaGroup", json=data, timeout=60).json()
     except Exception as e:
@@ -212,6 +249,62 @@ def pick_topic():
     topics = load_topics()
     return random.choice(topics) if topics else random.choice(DEFAULT_TOPICS)
 
+# ── URL / BLOG-LINK SUPPORT ──────────────────────────────
+URL_RE = re.compile(r'https?://\S+')
+
+def find_url(text):
+    m = URL_RE.search(text or "")
+    return m.group(0).rstrip(').,') if m else None
+
+def fetch_article(url, max_chars=4500):
+    """Fetch a blog URL and return (title, main_text). Empty strings on failure."""
+    try:
+        r = requests.get(url, timeout=20,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; Bot)"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script", "style", "nav", "header", "footer", "aside", "form", "noscript"]):
+            t.decompose()
+        title = soup.title.get_text(strip=True) if soup.title else ""
+        h1 = soup.find("h1")
+        if h1 and h1.get_text(strip=True):
+            title = h1.get_text(strip=True)
+        paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        text = "\n".join(p for p in paras if len(p) > 40)[:max_chars]
+        return title.strip(), text.strip()
+    except Exception as e:
+        print(f"[fetch] {url} failed: {e}")
+        return "", ""
+
+def caption_from_url(url):
+    """Generate a ready-to-post caption + hashtags from a blog link."""
+    title, text = fetch_article(url)
+    if not text:
+        return None
+    prompt = (
+        f"You write social captions for Gundrux, a digital marketing agency.\n\n"
+        f"Article title: {title}\nArticle content:\n{text}\n\n"
+        f"Return pure JSON only: "
+        f'{{"caption": "2-3 engaging lines summarizing the key idea for social media", '
+        f'"hashtags": "15 relevant hashtags as one string starting with #"}}\n'
+        f"English. Pure JSON only, no markdown."
+    )
+    try:
+        d = _claude_json(prompt)
+        return f"{d['caption']}\n\n{d['hashtags']}"
+    except Exception as e:
+        print(f"[caption_from_url] failed: {e}")
+        return None
+
+def resolve_caption(text):
+    """If the admin pasted just a blog link as the caption, build the caption
+    from that article. Otherwise use their text exactly as typed."""
+    url = find_url(text)
+    if url and len(text.replace(url, "").strip()) <= 12:
+        cap = caption_from_url(url)
+        if cap:
+            return cap
+    return text
+
 # ── CLAUDE: SINGLE POST CONTENT (5 tips on one image) ─────
 def _claude_json(prompt, max_retries=4):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -238,11 +331,19 @@ def _claude_json(prompt, max_retries=4):
             raise
     raise Exception("Claude API still overloaded after retries")
 
-def generate_single_content(topic):
+def generate_single_content(topic, source_text=None):
+    src_block = ""
+    if source_text:
+        src_block = (
+            f"Base the post strictly on this article. Pull the most useful, "
+            f"actionable points from it (do not invent unrelated tips):\n\n"
+            f"\"\"\"\n{source_text}\n\"\"\"\n\n"
+        )
     prompt = (
         f"You are a social media expert for Gundrux, a digital marketing agency "
         f"specializing in AI SEO, WordPress, social media growth, and AI automation.\n\n"
         f"Topic: {topic}\n\n"
+        f"{src_block}"
         f"Return pure JSON only with these keys:\n"
         f"1. title: punchy title max 8 words in English\n"
         f"2. points: exactly 5 actionable tips in English max 12 words each\n"
@@ -259,11 +360,18 @@ def generate_single_content(topic):
     return data
 
 # ── CLAUDE: CAROUSEL CONTENT (ONE tip told across 5 images) ─
-def generate_carousel_content(topic):
+def generate_carousel_content(topic, source_text=None):
+    src_block = ""
+    if source_text:
+        src_block = (
+            f"Base the carousel strictly on this article (pick its single most "
+            f"important takeaway as the tip):\n\n\"\"\"\n{source_text}\n\"\"\"\n\n"
+        )
     prompt = (
         f"You are a social media expert for Gundrux, a digital marketing agency "
         f"(AI SEO, WordPress, social media growth, AI automation).\n\n"
         f"Topic: {topic}\n\n"
+        f"{src_block}"
         f"Design an Instagram carousel that teaches ONE single tip, told across 5 slides. "
         f"Slide 1 is the cover (the tip itself). The next 4 slides break that SAME one tip "
         f"into clear steps/reasons/examples. Do NOT introduce different tips.\n\n"
@@ -584,25 +692,39 @@ def publish_post(image_urls, caption):
     return results
 
 # ── POST BUILDERS ─────────────────────────────────────────
+def _resolve_source(topic):
+    """If topic is a blog URL, fetch it. Returns (display_topic, source_text)."""
+    url = find_url(topic)
+    if not url:
+        return topic, None
+    title, text = fetch_article(url)
+    if text:
+        print(f"[source] scraped '{title or url}' ({len(text)} chars)")
+        return (title or url), text
+    print(f"[source] no usable text at {url}, using URL as plain topic")
+    return topic, None
+
 def build_single_post(topic):
-    print(f"\n[single] Topic: {topic}")
-    content = generate_single_content(topic)
+    display, source = _resolve_source(topic)
+    print(f"\n[single] Topic: {display}")
+    content = generate_single_content(display, source_text=source)
     print(f"[single] Title: {content.get('title','')}")
     caption = f"{content['caption']}\n\n{content['hashtags']}"
     imgs, tpl_idx = render_single(content)
-    urls = upload_many(imgs, topic)
-    return {"type": "single", "topic": topic, "content": content,
+    urls = upload_many(imgs, display)
+    return {"type": "single", "topic": display, "content": content,
             "images": urls, "caption": caption, "template": tpl_idx,
             "created_at": datetime.now(IST).isoformat()}
 
 def build_carousel_post(topic):
-    print(f"\n[carousel] Topic: {topic}")
-    content = generate_carousel_content(topic)
+    display, source = _resolve_source(topic)
+    print(f"\n[carousel] Topic: {display}")
+    content = generate_carousel_content(display, source_text=source)
     print(f"[carousel] Tip: {content.get('tip','')}")
     caption = f"{content['caption']}\n\n{content['hashtags']}"
     imgs = render_carousel(content)
-    urls = upload_many(imgs, topic)
-    return {"type": "carousel", "topic": topic, "content": content,
+    urls = upload_many(imgs, display)
+    return {"type": "carousel", "topic": display, "content": content,
             "images": urls, "caption": caption,
             "created_at": datetime.now(IST).isoformat()}
 
@@ -647,9 +769,10 @@ def send_awaiting_caption(post_id, post):
     else:
         tg_send_photo(post["images"][0], f"🖼 Post #{post_id} ({kind}) — images ready.")
     tg_send(
-        f"✍️ <b>Send the CAPTION for post #{post_id}.</b>\n"
-        f"Topic: {post['topic']}\n\n"
-        f"If you don't send a caption within {MANUAL_CAPTION_EXPIRY_HOURS}h, it will NOT be posted."
+        f"✍️ <b>This post needs a caption.</b> Post #{post_id} &middot; topic: {post['topic']}\n\n"
+        f"Any admin: reply with the caption, or use\n"
+        f"<code>/caption {post_id} your caption here</code>\n\n"
+        f"If no caption arrives within {MANUAL_CAPTION_EXPIRY_HOURS}h, it will NOT be posted."
     )
 
 # ── PUBLISH ───────────────────────────────────────────────
@@ -676,6 +799,11 @@ def do_publish(post_id):
 # ── CALLBACKS / MESSAGES ──────────────────────────────────
 def handle_callback(cb):
     data = cb["data"]
+    user_id = cb.get("from", {}).get("id")
+    chat_id = cb.get("message", {}).get("chat", {}).get("id")
+    if not is_authorized(user_id, chat_id):
+        tg_answer_callback(cb["id"], "Only group admins can do that.")
+        return
     tg_answer_callback(cb["id"])
 
     if data.startswith("approve_"):
@@ -714,56 +842,70 @@ def handle_message(msg):
     if not text:
         return
 
+    chat_id = msg.get("chat", {}).get("id")
+    user_id = msg.get("from", {}).get("id")
+
+    # Parse command + argument. In groups commands arrive as "/cmd@BotName arg".
+    parts = text.split(maxsplit=1)
+    cmd = parts[0].lower().split("@")[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    # /chatid works in ANY chat (no auth) so you can find your group's id.
+    if cmd in ("/chatid", "/id"):
+        tg_send(f"This chat id is: <code>{chat_id}</code>\n"
+                f"Put it in the TELEGRAM_CHAT_ID variable on Railway.",
+                chat_id=chat_id)
+        return
+
+    # Everything else: only inside the configured chat, and only admins.
+    if not is_authorized(user_id, chat_id):
+        return  # silently ignore non-admins / other chats
+
     aw = state["awaiting"]
 
-    # Caption for an edit
-    if isinstance(aw, tuple) and aw[0] == "edit":
+    # Caption for an "edit"
+    if isinstance(aw, tuple) and aw[0] == "edit" and not text.startswith("/"):
         post_id = aw[1]; state["awaiting"] = None
         if post_id in pending:
-            pending[post_id]["caption"] = text
+            pending[post_id]["caption"] = resolve_caption(text)
             tg_send(f"✏️ Caption updated for post #{post_id}.", approval_markup(post_id))
         return
 
-    # Manual caption for a built post
-    if isinstance(aw, tuple) and aw[0] == "caption":
+    # Manual caption typed after a prompt (works in private chats or privacy-off groups)
+    if isinstance(aw, tuple) and aw[0] == "caption" and not text.startswith("/"):
         post_id = aw[1]; state["awaiting"] = None
         if post_id in pending:
-            pending[post_id]["caption"] = text
+            pending[post_id]["caption"] = resolve_caption(text)
             pending[post_id]["awaiting_caption"] = False
             tg_send(f"✅ Caption set for post #{post_id}. Approve to publish:", approval_markup(post_id))
         return
 
-    # Topic for an on-demand carousel
-    if aw == "carousel_topic":
+    # Topic typed after a /carousel prompt
+    if aw == "carousel_topic" and not text.startswith("/"):
         state["awaiting"] = None
-        tg_send(f"🎠 Building 1-tip carousel for: <b>{text}</b> ...")
-        try:
-            send_for_approval(int(time.time()) % 100000, build_carousel_post(text))
-        except Exception as e:
-            tg_send(f"❌ Carousel build failed: {e}")
+        _make_carousel(text)
         return
 
-    # Topic for an on-demand single
-    if aw == "single_topic":
+    # Topic typed after a /single prompt
+    if aw == "single_topic" and not text.startswith("/"):
         state["awaiting"] = None
-        tg_send(f"🖼 Building single post for: <b>{text}</b> ...")
-        try:
-            send_for_approval(int(time.time()) % 100000, build_single_post(text))
-        except Exception as e:
-            tg_send(f"❌ Build failed: {e}")
+        _make_single(text)
         return
 
-    # Commands
-    cmd = text.lower().split()[0]
+    # ── Commands ──
     if cmd in ("/start", "/help"):
         tg_send(
             "🤖 <b>Gundrux Bot</b>\n\n"
+            "<b>Anyone who is a group admin can use these:</b>\n"
             "/post — auto single post (random topic) now\n"
-            "/single — single post on a topic YOU type\n"
-            "/carousel — 5-image, 1-tip carousel on a topic YOU type\n"
+            "/single TOPIC — single post on a topic (or paste a blog link)\n"
+            "/carousel TOPIC — 5-image, 1-tip carousel (or paste a blog link)\n"
+            "/caption ID TEXT — set caption (paste a blog link to auto-write it)\n"
+            "/chatid — show this chat's id\n"
             "/help — this menu\n\n"
+            "Then tap ✅ Approve / ❌ Reject / ✏️ Edit / 🔄 Regenerate.\n\n"
             f"Daily auto: {', '.join(s['time'] for s in SCHEDULE)} IST. "
-            "The 6 PM slot waits for YOUR caption before it can post."
+            "The 6 PM slot waits for an admin's caption before it can post."
         )
     elif cmd == "/post":
         tg_send("🖼 Generating an auto single post now...")
@@ -772,21 +914,53 @@ def handle_message(msg):
         except Exception as e:
             tg_send(f"❌ Failed: {e}")
     elif cmd == "/single":
-        state["awaiting"] = "single_topic"
-        tg_send("🖼 Send me the topic / text for the single post:")
+        if arg:
+            _make_single(arg)
+        else:
+            state["awaiting"] = "single_topic"
+            tg_send("🖼 Send the topic for the single post (or use /single TOPIC):")
     elif cmd == "/carousel":
-        state["awaiting"] = "carousel_topic"
-        tg_send("🎠 Send me the topic. I'll make a 5-image carousel built around ONE tip:")
+        if arg:
+            _make_carousel(arg)
+        else:
+            state["awaiting"] = "carousel_topic"
+            tg_send("🎠 Send the topic (or use /carousel TOPIC). I'll build a 5-image, 1-tip carousel:")
+    elif cmd == "/caption":
+        cap_parts = arg.split(maxsplit=1)
+        if len(cap_parts) < 2 or not cap_parts[0].isdigit():
+            tg_send("Usage: /caption POSTID your caption text here")
+        else:
+            post_id = int(cap_parts[0]); caption = cap_parts[1].strip()
+            if post_id in pending:
+                pending[post_id]["caption"] = resolve_caption(caption)
+                pending[post_id]["awaiting_caption"] = False
+                tg_send(f"✅ Caption set for post #{post_id}. Approve to publish:", approval_markup(post_id))
+            else:
+                tg_send(f"⚠️ Post #{post_id} not found (it may have expired).")
     else:
-        # Fallback: if a manual-caption post is waiting and state was lost, treat this as its caption.
+        # Plain text with no active prompt: if a manual-caption post is waiting, use it as its caption.
         waiting = [pid for pid, p in pending.items() if p.get("awaiting_caption")]
-        if waiting:
+        if waiting and not text.startswith("/"):
             post_id = sorted(waiting)[-1]
-            pending[post_id]["caption"] = text
+            pending[post_id]["caption"] = resolve_caption(text)
             pending[post_id]["awaiting_caption"] = False
             tg_send(f"✅ Caption set for post #{post_id}. Approve to publish:", approval_markup(post_id))
-        else:
+        elif text.startswith("/"):
             tg_send("Unknown command. Send /help to see options.")
+
+def _make_single(topic):
+    tg_send(f"🖼 Building single post for: <b>{topic}</b> ...")
+    try:
+        send_for_approval(int(time.time()) % 100000, build_single_post(topic))
+    except Exception as e:
+        tg_send(f"❌ Build failed: {e}")
+
+def _make_carousel(topic):
+    tg_send(f"🎠 Building 1-tip carousel for: <b>{topic}</b> ...")
+    try:
+        send_for_approval(int(time.time()) % 100000, build_carousel_post(topic))
+    except Exception as e:
+        tg_send(f"❌ Carousel build failed: {e}")
 
 # ── SCHEDULER ─────────────────────────────────────────────
 def fire_slot(slot):
