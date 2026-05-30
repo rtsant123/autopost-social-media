@@ -5,13 +5,14 @@ import time
 # Force unbuffered output for Railway logs
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
+
+import re
 import json
 import random
 import requests
 import cloudinary
 import cloudinary.uploader
-from datetime import datetime, date
-from io import BytesIO
+from datetime import datetime, date, timezone, timedelta
 import anthropic
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
@@ -29,6 +30,27 @@ TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 BUFFER_FB_CHANNEL  = "6a0b3f9e090476fb9932d776"
 BUFFER_IG_CHANNEL  = "6a0b4005090476fb9932d92e"
 BUFFER_LI_CHANNEL  = "6a0bf7b7090476fb99360b4e"  # Gundrux company page
+
+# India timezone
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# ── DAILY SCHEDULE (India time) ───────────────────────────
+# type:           "single" or "carousel"
+# manual_caption: True  -> bot builds images, then WAITS for you to send a caption.
+#                          If you don't send one, the post is NOT published.
+#                 False -> Claude writes the caption automatically.
+# To make the 6 PM post a single instead of a carousel, change its "type" to "single".
+SCHEDULE = [
+    {"time": "09:00", "type": "single",   "manual_caption": False},
+    {"time": "13:00", "type": "single",   "manual_caption": False},
+    {"time": "18:00", "type": "carousel", "manual_caption": True},
+]
+
+# A carousel = 1 cover slide showing ONE tip + this many detail slides = 5 images total.
+CAROUSEL_DETAIL_SLIDES = 4
+
+# How long a manual-caption post waits for your caption before it's dropped (not posted).
+MANUAL_CAPTION_EXPIRY_HOURS = 4
 
 # Blog sources to scrape topics from
 BLOG_SOURCES = [
@@ -52,41 +74,50 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ── TELEGRAM HELPERS ─────────────────────────────────────
 def tg_send(text, reply_markup=None):
-    print(f"[telegram] sending text...")
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     try:
-        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=data, timeout=30)
-        result = resp.json()
-        print(f"[telegram] response: {result.get('ok', False)}")
-        return result
+        return requests.post(f"{TELEGRAM_API}/sendMessage", json=data, timeout=30).json()
     except Exception as e:
-        print(f"[telegram] ERROR: {e}")
+        print(f"[telegram] send ERROR: {e}")
         return {"ok": False, "error": str(e)}
 
 def tg_send_photo(image_url, caption, reply_markup=None):
-    print(f"[telegram] sending photo to {TELEGRAM_CHAT_ID}...")
-    data = {"chat_id": TELEGRAM_CHAT_ID, "photo": image_url, "caption": caption[:1024], "parse_mode": "HTML"}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "photo": image_url,
+            "caption": caption[:1024], "parse_mode": "HTML"}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     try:
-        resp = requests.post(f"{TELEGRAM_API}/sendPhoto", json=data, timeout=30)
-        result = resp.json()
-        print(f"[telegram] response: {result}")
-        return result
+        return requests.post(f"{TELEGRAM_API}/sendPhoto", json=data, timeout=30).json()
     except Exception as e:
-        print(f"[telegram] ERROR: {e}")
+        print(f"[telegram] photo ERROR: {e}")
+        return {"ok": False, "error": str(e)}
+
+def tg_send_media_group(image_urls):
+    """Send up to 10 images as one swipeable album. No buttons allowed on albums."""
+    media = [{"type": "photo", "media": u} for u in image_urls[:10]]
+    data = {"chat_id": TELEGRAM_CHAT_ID, "media": json.dumps(media)}
+    try:
+        return requests.post(f"{TELEGRAM_API}/sendMediaGroup", json=data, timeout=60).json()
+    except Exception as e:
+        print(f"[telegram] media group ERROR: {e}")
         return {"ok": False, "error": str(e)}
 
 def tg_answer_callback(callback_id, text=""):
-    requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": text})
-
-def tg_get_updates(offset=0):
     try:
-        resp = requests.get(f"{TELEGRAM_API}/getUpdates", params={"offset": offset, "timeout": 25}, timeout=30)
+        requests.post(f"{TELEGRAM_API}/answerCallbackQuery",
+                      json={"callback_query_id": callback_id, "text": text}, timeout=15)
+    except Exception:
+        pass
+
+def tg_get_updates(offset=0, timeout=10):
+    try:
+        resp = requests.get(f"{TELEGRAM_API}/getUpdates",
+                            params={"offset": offset, "timeout": timeout},
+                            timeout=timeout + 10)
         return resp.json().get("result", [])
-    except:
+    except Exception:
         return []
 
 # ── HISTORY ──────────────────────────────────────────────
@@ -95,7 +126,7 @@ def load_history():
         try:
             with open(HISTORY_FILE) as f:
                 return json.load(f)
-        except:
+        except Exception:
             return []
     return []
 
@@ -108,7 +139,8 @@ def save_history(entry):
 # ── TOPIC SCRAPING (MULTI-SOURCE) ────────────────────────
 def scrape_topics_from(url):
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; Bot)"})
+        resp = requests.get(url, timeout=15,
+                            headers={"User-Agent": "Mozilla/5.0 (compatible; Bot)"})
         soup = BeautifulSoup(resp.text, "html.parser")
         titles = []
         for tag in soup.find_all(["h2", "h3", "h1", "a"]):
@@ -117,11 +149,10 @@ def scrape_topics_from(url):
                 continue
             if text.lower().startswith(("subscribe", "sign up", "log in", "menu")):
                 continue
-            # Filter out brand/source mentions
-            brands = ["ahrefs", "moz", "semrush", "backlinko", "webdoux", "course by", "| 3.", "| 2.", "| 1.", " by ", "feat.", "ft.", "podcast"]
+            brands = ["ahrefs", "moz", "semrush", "backlinko", "webdoux", "course by",
+                      "| 3.", "| 2.", "| 1.", " by ", "feat.", "ft.", "podcast"]
             if any(b in text.lower() for b in brands):
                 continue
-            # Clean up
             text = text.split(" | ")[0].split(" - ")[0].strip()
             if 20 < len(text) < 100:
                 titles.append(text)
@@ -171,7 +202,6 @@ def load_topics():
             print(f"  Custom topics: {len(custom)}")
     if len(topics) < 10:
         topics.extend(DEFAULT_TOPICS)
-    # Dedupe + filter already-posted
     history = load_history()
     posted = {h.get("topic", "").lower() for h in history if h.get("status") == "approved"}
     fresh = [t for t in set(topics) if t.lower() not in posted]
@@ -182,12 +212,22 @@ def pick_topic():
     topics = load_topics()
     return random.choice(topics) if topics else random.choice(DEFAULT_TOPICS)
 
-# ── CLAUDE HAIKU ──────────────────────────────────────────
-def generate_content(topic, max_retries=4):
+# ── CLAUDE: SINGLE POST CONTENT (5 tips on one image) ─────
+def _claude_json(prompt, max_retries=4):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     for attempt in range(max_retries):
         try:
-            return _call_claude(client, topic)
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            raw = msg.content[0].text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            return json.loads(raw.strip())
         except Exception as e:
             err = str(e)
             if "overloaded" in err.lower() or "529" in err or "rate" in err.lower():
@@ -198,46 +238,56 @@ def generate_content(topic, max_retries=4):
             raise
     raise Exception("Claude API still overloaded after retries")
 
-def _call_claude(client, topic):
-    message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"You are a social media expert for Gundrux, a digital marketing agency "
-                f"specializing in AI SEO, WordPress, social media growth, and AI automation.\n\n"
-                f"Topic: {topic}\n\n"
-                f"Return pure JSON only with these keys:\n"
-                f"1. title: punchy title max 8 words in English\n"
-                f"2. points: exactly 5 actionable tips in English max 12 words each\n"
-                f"3. caption: 2-3 engaging lines for social media in English\n"
-                f"4. hashtags: 15 relevant hashtags as single string starting with #\n"
-                f"5. category: pick one: SEO TIPS / WORDPRESS / SOCIAL MEDIA / AI MARKETING / CONTENT GROWTH\n\n"
-                f"Pure JSON only. No markdown."
-            )
-        }]
+def generate_single_content(topic):
+    prompt = (
+        f"You are a social media expert for Gundrux, a digital marketing agency "
+        f"specializing in AI SEO, WordPress, social media growth, and AI automation.\n\n"
+        f"Topic: {topic}\n\n"
+        f"Return pure JSON only with these keys:\n"
+        f"1. title: punchy title max 8 words in English\n"
+        f"2. points: exactly 5 actionable tips in English max 12 words each\n"
+        f"3. caption: 2-3 engaging lines for social media in English\n"
+        f"4. hashtags: 15 relevant hashtags as single string starting with #\n"
+        f"5. category: pick one: SEO TIPS / WORDPRESS / SOCIAL MEDIA / AI MARKETING / CONTENT GROWTH\n\n"
+        f"Pure JSON only. No markdown."
     )
-    raw = message.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
+    data = _claude_json(prompt)
+    pts = list(data.get("points", []))
+    while len(pts) < 5:
+        pts.append("Stay consistent and track your results daily")
+    data["points"] = pts[:5]
+    return data
 
-# ── HTML TEMPLATES (3 ROTATING) ──────────────────────────
-def template_dark_indigo(c):
-    return TEMPLATE_DARK_INDIGO.format(**c)
+# ── CLAUDE: CAROUSEL CONTENT (ONE tip told across 5 images) ─
+def generate_carousel_content(topic):
+    prompt = (
+        f"You are a social media expert for Gundrux, a digital marketing agency "
+        f"(AI SEO, WordPress, social media growth, AI automation).\n\n"
+        f"Topic: {topic}\n\n"
+        f"Design an Instagram carousel that teaches ONE single tip, told across 5 slides. "
+        f"Slide 1 is the cover (the tip itself). The next 4 slides break that SAME one tip "
+        f"into clear steps/reasons/examples. Do NOT introduce different tips.\n\n"
+        f"Return pure JSON only with these keys:\n"
+        f'1. tip: the one core tip, max 9 words (this is the cover headline)\n'
+        f'2. category: pick one: SEO TIPS / WORDPRESS / SOCIAL MEDIA / AI MARKETING / CONTENT GROWTH\n'
+        f'3. slides: exactly 4 objects, each {{"heading": "max 5 words", "body": "max 16 words"}}, '
+        f'   each expanding the SAME single tip step by step\n'
+        f'4. caption: 2-3 engaging lines for social media\n'
+        f'5. hashtags: 15 relevant hashtags as single string starting with #\n\n'
+        f"All English. Pure JSON only. No markdown."
+    )
+    data = _claude_json(prompt)
+    slides = list(data.get("slides", []))
+    while len(slides) < CAROUSEL_DETAIL_SLIDES:
+        slides.append({"heading": "Pro tip", "body": "Stay consistent and measure your results every week."})
+    data["slides"] = slides[:CAROUSEL_DETAIL_SLIDES]
+    if not data.get("tip"):
+        data["tip"] = data.get("title", topic)
+    return data
 
-def template_split_purple(c):
-    return TEMPLATE_SPLIT_PURPLE.format(**c)
-
-def template_minimal_neon(c):
-    return TEMPLATE_MINIMAL_NEON.format(**c)
-
-TEMPLATES = [template_dark_indigo, template_minimal_neon]
-
-# Template 1: Dark Indigo with icons
+# ══════════════════════════════════════════════════════════
+#  SINGLE-POST TEMPLATES (unchanged)
+# ══════════════════════════════════════════════════════════
 TEMPLATE_DARK_INDIGO = """<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
@@ -248,7 +298,6 @@ body{{width:1080px;height:1080px;overflow:hidden;font-family:'Inter',sans-serif;
 .watermark{{position:absolute;bottom:-30px;left:-20px;font-size:220px;font-weight:900;color:rgba(99,102,241,0.06);letter-spacing:-8px;pointer-events:none;z-index:1;white-space:nowrap;}}
 .glow1{{position:absolute;top:-150px;left:-150px;width:600px;height:600px;background:radial-gradient(circle,rgba(99,102,241,0.18) 0%,transparent 70%);}}
 .glow2{{position:absolute;bottom:-150px;right:-100px;width:500px;height:500px;background:radial-gradient(circle,rgba(139,92,246,0.12) 0%,transparent 70%);}}
-.icon-box{{position:absolute;z-index:1;opacity:0.15;width:56px;height:56px;border-radius:14px;display:flex;align-items:center;justify-content:center;}}
 .top-bar{{display:flex;justify-content:space-between;align-items:center;position:relative;z-index:10;}}
 .logo img{{height:34px;object-fit:contain;}}
 .tag{{background:rgba(99,102,241,0.2);border:1px solid rgba(99,102,241,0.5);color:#A5B4FC;font-size:15px;font-weight:700;letter-spacing:2px;padding:8px 20px;border-radius:100px;}}
@@ -269,15 +318,6 @@ body{{width:1080px;height:1080px;overflow:hidden;font-family:'Inter',sans-serif;
 <div class="post">
   <div class="grid"></div><div class="glow1"></div><div class="glow2"></div>
   <div class="watermark">GUNDRUX</div>
-  <div class="icon-box" style="top:100px;right:65px;background:linear-gradient(45deg,#f09433,#dc2743,#bc1888);"><svg width="30" height="30" viewBox="0 0 24 24" fill="white"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zM12 0C8.741 0 8.333.014 7.053.072 2.695.272.273 2.69.073 7.052.014 8.333 0 8.741 0 12c0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98C8.333 23.986 8.741 24 12 24c3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98C15.668.014 15.259 0 12 0zm0 5.838a6.162 6.162 0 100 12.324 6.162 6.162 0 000-12.324zM12 16a4 4 0 110-8 4 4 0 010 8zm6.406-11.845a1.44 1.44 0 100 2.881 1.44 1.44 0 000-2.881z"/></svg></div>
-  <div class="icon-box" style="top:195px;right:165px;background:#1877F2;"><svg width="30" height="30" viewBox="0 0 24 24" fill="white"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg></div>
-  <div class="icon-box" style="top:305px;right:70px;background:#FF0000;"><svg width="30" height="30" viewBox="0 0 24 24" fill="white"><path d="M23.495 6.205a3.007 3.007 0 00-2.088-2.088c-1.87-.501-9.396-.501-9.396-.501s-7.507-.01-9.396.501A3.007 3.007 0 00.527 6.205a31.247 31.247 0 00-.522 5.805 31.247 31.247 0 00.522 5.783 3.007 3.007 0 002.088 2.088c1.868.502 9.396.502 9.396.502s7.506 0 9.396-.502a3.007 3.007 0 002.088-2.088 31.247 31.247 0 00.5-5.783 31.247 31.247 0 00-.5-5.805zM9.609 15.601V8.408l6.264 3.602z"/></svg></div>
-  <div class="icon-box" style="top:410px;right:175px;background:#0A66C2;"><svg width="30" height="30" viewBox="0 0 24 24" fill="white"><path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 01-2.063-2.065 2.064 2.064 0 112.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/></svg></div>
-  <div class="icon-box" style="top:510px;right:70px;background:#fff;"><svg width="30" height="30" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg></div>
-  <div class="icon-box" style="top:610px;right:175px;background:linear-gradient(135deg,#6366F1,#8B5CF6);"><svg width="30" height="30" viewBox="0 0 24 24" fill="white"><path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729z"/></svg></div>
-  <div class="icon-box" style="top:150px;right:265px;background:linear-gradient(135deg,#10B981,#059669);"><svg width="30" height="30" viewBox="0 0 24 24" fill="white"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg></div>
-  <div class="icon-box" style="top:370px;right:275px;background:linear-gradient(135deg,#F59E0B,#D97706);"><svg width="30" height="30" viewBox="0 0 24 24" fill="white"><path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99l1.5 1.5z"/></svg></div>
-  <div class="icon-box" style="top:560px;right:270px;background:#21759B;"><svg width="30" height="30" viewBox="0 0 24 24" fill="white"><path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 1.542c2.282 0 4.368.813 6 2.148L5.69 18c-1.335-1.632-2.148-3.718-2.148-6C3.542 7.144 7.144 3.542 12 3.542z"/></svg></div>
   <div class="top-bar">
     <div class="logo"><img src="https://gundrux.in/wp-content/uploads/2026/03/cropped-cropped-ChatGPT_Image_Mar_21__2026__02_13_51_PM-removebg-preview-1-250x42.png" /></div>
     <div class="tag">{category}</div>
@@ -296,59 +336,10 @@ body{{width:1080px;height:1080px;overflow:hidden;font-family:'Inter',sans-serif;
   </div>
   <div class="bottom">
     <div class="domain">gundrux.in</div>
-    <div class="services">AI SEO · AEO · GEO · Brand Growth</div>
+    <div class="services">AI SEO &middot; AEO &middot; GEO &middot; Brand Growth</div>
   </div>
 </div></body></html>"""
 
-# Template 2: Split Purple
-TEMPLATE_SPLIT_PURPLE = """<!DOCTYPE html><html><head><meta charset="UTF-8">
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
-*{{margin:0;padding:0;box-sizing:border-box;}}
-body{{width:1080px;height:1080px;overflow:hidden;font-family:'Inter',sans-serif;}}
-.post{{width:1080px;height:1080px;background:#08080F;position:relative;overflow:hidden;}}
-.left{{position:absolute;top:0;left:0;width:60%;height:100%;background:linear-gradient(180deg,#0A0A14 0%,#15102B 100%);padding:48px 56px;display:flex;flex-direction:column;justify-content:space-between;z-index:5;}}
-.right{{position:absolute;top:0;right:0;width:42%;height:100%;background:linear-gradient(135deg,#1E1B4B 0%,#312E81 100%);padding:60px 40px;display:flex;flex-direction:column;justify-content:center;z-index:4;}}
-.right::before{{content:'';position:absolute;top:0;left:-40px;width:80px;height:100%;background:linear-gradient(90deg,transparent,#15102B);}}
-.glow{{position:absolute;top:-200px;left:-100px;width:600px;height:600px;background:radial-gradient(circle,rgba(139,92,246,0.25) 0%,transparent 70%);}}
-.logo img{{height:36px;}}
-.tag{{display:inline-block;background:rgba(192,132,252,0.2);border:1px solid rgba(192,132,252,0.5);color:#E9D5FF;font-size:14px;font-weight:700;letter-spacing:2px;padding:8px 18px;border-radius:100px;margin-top:20px;width:fit-content;}}
-.title{{font-size:64px;font-weight:900;color:white;line-height:1.05;letter-spacing:-2px;margin-top:40px;}}
-.title .hl{{background:linear-gradient(90deg,#C084FC,#F0ABFC);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}}
-.bottom-left{{margin-top:30px;}}
-.domain{{font-size:24px;font-weight:800;color:#C084FC;}}
-.services{{font-size:16px;color:#94A3B8;margin-top:6px;}}
-.points-header{{font-size:16px;font-weight:700;color:#C084FC;letter-spacing:3px;text-transform:uppercase;margin-bottom:20px;}}
-.divider{{width:50px;height:3px;background:linear-gradient(90deg,#C084FC,transparent);margin-bottom:30px;}}
-.point{{display:flex;align-items:flex-start;gap:14px;margin-bottom:24px;}}
-.point-num{{font-size:34px;font-weight:900;color:#C084FC;line-height:1;flex-shrink:0;min-width:50px;}}
-.point-text{{font-size:22px;font-weight:500;color:#E2E8F0;line-height:1.4;}}
-</style></head><body>
-<div class="post">
-  <div class="glow"></div>
-  <div class="left">
-    <div>
-      <div class="logo"><img src="https://gundrux.in/wp-content/uploads/2026/03/cropped-cropped-ChatGPT_Image_Mar_21__2026__02_13_51_PM-removebg-preview-1-250x42.png" /></div>
-      <div class="tag">{category}</div>
-      <div class="title">{title_line1}<br><span class="hl">{title_line2}</span></div>
-    </div>
-    <div class="bottom-left">
-      <div class="domain">gundrux.in</div>
-      <div class="services">AI SEO · AEO · GEO · Brand Growth</div>
-    </div>
-  </div>
-  <div class="right">
-    <div class="points-header">KEY TIPS</div>
-    <div class="divider"></div>
-    <div class="point"><div class="point-num">01</div><div class="point-text">{p1}</div></div>
-    <div class="point"><div class="point-num">02</div><div class="point-text">{p2}</div></div>
-    <div class="point"><div class="point-num">03</div><div class="point-text">{p3}</div></div>
-    <div class="point"><div class="point-num">04</div><div class="point-text">{p4}</div></div>
-    <div class="point"><div class="point-num">05</div><div class="point-text">{p5}</div></div>
-  </div>
-</div></body></html>"""
-
-# Template 3: Minimal Neon
 TEMPLATE_MINIMAL_NEON = """<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
@@ -396,65 +387,157 @@ body{{width:1080px;height:1080px;overflow:hidden;font-family:'Inter',sans-serif;
   </div>
   <div class="bottom">
     <div class="domain">gundrux.in</div>
-    <div class="services">AI SEO · AEO · GEO · Brand Growth</div>
+    <div class="services">AI SEO &middot; AEO &middot; GEO &middot; Brand Growth</div>
   </div>
 </div></body></html>"""
 
-def render_image(content_data):
-    print("  [render] preparing data...")
-    words = content_data["title"].split()
-    mid = max(1, len(words) // 2)
-    points = content_data["points"]
-    while len(points) < 5:
-        points.append("Stay consistent and track your results daily")
+def template_dark_indigo(c):  return TEMPLATE_DARK_INDIGO.format(**c)
+def template_minimal_neon(c): return TEMPLATE_MINIMAL_NEON.format(**c)
+TEMPLATES = [template_dark_indigo, template_minimal_neon]
 
+# ══════════════════════════════════════════════════════════
+#  CAROUSEL TEMPLATES — cover (the one tip) + detail slides
+# ══════════════════════════════════════════════════════════
+CAROUSEL_COVER = """<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{width:1080px;height:1080px;overflow:hidden;font-family:'Inter',sans-serif;}}
+.post{{width:1080px;height:1080px;background:linear-gradient(135deg,#0D0D1A 0%,#0A0A14 55%,#15102B 100%);position:relative;overflow:hidden;display:flex;flex-direction:column;justify-content:center;padding:70px 64px;}}
+.grid{{position:absolute;inset:0;background-image:linear-gradient(rgba(99,102,241,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(99,102,241,0.05) 1px,transparent 1px);background-size:80px 80px;}}
+.glow1{{position:absolute;top:-150px;left:-150px;width:650px;height:650px;background:radial-gradient(circle,rgba(99,102,241,0.20) 0%,transparent 70%);}}
+.glow2{{position:absolute;bottom:-180px;right:-120px;width:560px;height:560px;background:radial-gradient(circle,rgba(139,92,246,0.14) 0%,transparent 70%);}}
+.watermark{{position:absolute;bottom:-40px;left:-25px;font-size:240px;font-weight:900;color:rgba(99,102,241,0.06);letter-spacing:-8px;}}
+.logo img{{height:40px;position:relative;z-index:10;}}
+.counter{{position:absolute;top:64px;right:64px;font-size:22px;font-weight:700;color:#6366F1;letter-spacing:2px;z-index:10;}}
+.tag{{display:inline-block;background:rgba(99,102,241,0.2);border:1px solid rgba(99,102,241,0.5);color:#A5B4FC;font-size:17px;font-weight:700;letter-spacing:3px;padding:10px 24px;border-radius:100px;margin-top:34px;width:fit-content;position:relative;z-index:10;}}
+.title{{font-size:92px;font-weight:900;color:#FFFFFF;line-height:1.03;letter-spacing:-3px;margin-top:34px;position:relative;z-index:10;}}
+.title .hl{{background:linear-gradient(90deg,#818CF8,#C084FC);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}}
+.swipe{{position:absolute;bottom:64px;right:64px;display:flex;align-items:center;gap:14px;color:#A5B4FC;font-size:24px;font-weight:700;z-index:10;}}
+.swipe-arrow{{font-size:34px;}}
+.domain{{position:absolute;bottom:64px;left:64px;font-size:26px;font-weight:800;color:#6366F1;z-index:10;}}
+</style></head><body>
+<div class="post">
+  <div class="grid"></div><div class="glow1"></div><div class="glow2"></div>
+  <div class="watermark">GUNDRUX</div>
+  <div class="logo"><img src="https://gundrux.in/wp-content/uploads/2026/03/cropped-cropped-ChatGPT_Image_Mar_21__2026__02_13_51_PM-removebg-preview-1-250x42.png" /></div>
+  <div class="counter">{counter}</div>
+  <div class="tag">{category}</div>
+  <div class="title">{title_line1}<br><span class="hl">{title_line2}</span></div>
+  <div class="domain">gundrux.in</div>
+  <div class="swipe">SWIPE <span class="swipe-arrow">&rarr;</span></div>
+</div></body></html>"""
+
+CAROUSEL_DETAIL = """<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{width:1080px;height:1080px;overflow:hidden;font-family:'Inter',sans-serif;}}
+.post{{width:1080px;height:1080px;background:linear-gradient(135deg,#0A0A14 0%,#0D0D1A 100%);position:relative;overflow:hidden;display:flex;flex-direction:column;justify-content:center;padding:80px 70px;}}
+.grid{{position:absolute;inset:0;background-image:linear-gradient(rgba(99,102,241,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(99,102,241,0.05) 1px,transparent 1px);background-size:80px 80px;}}
+.glow{{position:absolute;top:-150px;right:-120px;width:560px;height:560px;background:radial-gradient(circle,rgba(99,102,241,0.16) 0%,transparent 70%);}}
+.bignum{{position:absolute;top:50px;left:64px;font-size:210px;font-weight:900;color:rgba(99,102,241,0.10);line-height:1;letter-spacing:-10px;z-index:1;}}
+.counter{{position:absolute;top:64px;right:70px;font-size:22px;font-weight:700;color:#6366F1;letter-spacing:2px;z-index:10;}}
+.numbox{{width:84px;height:84px;background:linear-gradient(135deg,#6366F1,#8B5CF6);border-radius:20px;display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:900;color:white;box-shadow:0 0 30px rgba(99,102,241,0.45);position:relative;z-index:10;}}
+.heading{{font-size:56px;font-weight:900;color:#FFFFFF;line-height:1.1;letter-spacing:-1px;margin-top:34px;position:relative;z-index:10;}}
+.heading .hl{{background:linear-gradient(90deg,#818CF8,#C084FC);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}}
+.body{{font-size:38px;font-weight:500;color:#CBD5E1;line-height:1.4;margin-top:24px;position:relative;z-index:10;}}
+.domain{{position:absolute;bottom:64px;left:70px;font-size:24px;font-weight:800;color:#6366F1;z-index:10;}}
+.brand{{position:absolute;bottom:64px;right:70px;font-size:18px;color:#475569;z-index:10;}}
+</style></head><body>
+<div class="post">
+  <div class="grid"></div><div class="glow"></div>
+  <div class="bignum">{num}</div>
+  <div class="counter">{counter}</div>
+  <div class="numbox">{num}</div>
+  <div class="heading"><span class="hl">{heading}</span></div>
+  <div class="body">{body}</div>
+  <div class="domain">gundrux.in</div>
+  <div class="brand">AI SEO &middot; AEO &middot; GEO</div>
+</div></body></html>"""
+
+# ── RENDERING ─────────────────────────────────────────────
+def _split_title(title):
+    words = title.split()
+    mid = max(1, len(words) // 2)
+    return " ".join(words[:mid]), " ".join(words[mid:])
+
+def _screenshot_html(page, html):
+    with open("/tmp/render.html", "w") as f:
+        f.write(html)
+    page.goto("file:///tmp/render.html", timeout=15000)
+    page.wait_for_timeout(1500)
+    return page.screenshot(full_page=False)
+
+def render_single(content_data):
+    line1, line2 = _split_title(content_data["title"])
+    points = content_data["points"]
     data = {
         "category": content_data.get("category", "DIGITAL MARKETING"),
-        "title_line1": " ".join(words[:mid]),
-        "title_line2": " ".join(words[mid:]),
+        "title_line1": line1, "title_line2": line2,
         "p1": points[0], "p2": points[1], "p3": points[2],
-        "p4": points[3], "p5": points[4]
+        "p4": points[3], "p5": points[4],
     }
-
-    hour = datetime.now().hour
-    template_idx = hour % len(TEMPLATES)
-    template_fn = TEMPLATES[template_idx]
-    html = template_fn(data)
-    print(f"  [render] template {template_idx+1} selected, html size: {len(html)}")
-
-    with open("/tmp/post_render.html", "w") as f:
-        f.write(html)
-    print("  [render] html saved")
-
-    print("  [render] launching chromium...")
+    tpl_idx = datetime.now(IST).hour % len(TEMPLATES)
+    html = TEMPLATES[tpl_idx](data)
     with sync_playwright() as p:
         browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-        print("  [render] browser launched")
         page = browser.new_page(viewport={"width": 1080, "height": 1080})
-        print("  [render] page created, navigating...")
-        page.goto("file:///tmp/post_render.html", timeout=15000)
-        print("  [render] page loaded, waiting 2s for fonts...")
-        page.wait_for_timeout(2000)
-        print("  [render] taking screenshot...")
-        img_bytes = page.screenshot(full_page=False)
-        print(f"  [render] screenshot done, {len(img_bytes)} bytes")
+        img = _screenshot_html(page, html)
         browser.close()
-        print("  [render] browser closed")
-    return img_bytes, template_idx
+    return [img], tpl_idx
 
-def upload_cloudinary(image_bytes, topic):
-    import re
+def render_carousel(content_data):
+    """5 images = 1 cover (the one tip) + 4 detail slides expanding that same tip."""
+    total = 1 + CAROUSEL_DETAIL_SLIDES
+    line1, line2 = _split_title(content_data["tip"])
+    slides = content_data["slides"]
+
+    images = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+        page = browser.new_page(viewport={"width": 1080, "height": 1080})
+
+        cover = CAROUSEL_COVER.format(
+            category=content_data.get("category", "DIGITAL MARKETING"),
+            title_line1=line1, title_line2=line2,
+            counter=f"01 / {total:02d}",
+        )
+        images.append(_screenshot_html(page, cover))
+        print("  [carousel] cover rendered")
+
+        for i, s in enumerate(slides, start=2):
+            html = CAROUSEL_DETAIL.format(
+                num=f"{i:02d}", counter=f"{i:02d} / {total:02d}",
+                heading=s.get("heading", ""), body=s.get("body", ""),
+            )
+            images.append(_screenshot_html(page, html))
+            print(f"  [carousel] detail slide {i} rendered")
+
+        browser.close()
+    return images
+
+def upload_cloudinary(image_bytes, topic, idx=0):
     slug = re.sub(r"[^a-zA-Z0-9_-]", "_", topic[:25])
     result = cloudinary.uploader.upload(
         image_bytes,
         folder="social_posts",
-        public_id=f"{date.today()}_{slug}_{int(time.time())}",
+        public_id=f"{date.today()}_{slug}_{int(time.time())}_{idx}",
         resource_type="image"
     )
     return result["secure_url"]
 
+def upload_many(image_bytes_list, topic):
+    urls = []
+    for i, img in enumerate(image_bytes_list):
+        url = upload_cloudinary(img, topic, idx=i)
+        print(f"  [upload] {i+1}/{len(image_bytes_list)} -> {url}")
+        urls.append(url)
+    return urls
+
 # ── BUFFER POSTING ───────────────────────────────────────
-def post_buffer(image_url, caption, channel_id, platform):
+def post_buffer(image_urls, caption, channel_id, platform):
+    """One url = normal post. Multiple urls = carousel."""
     query = """
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
@@ -463,13 +546,14 @@ def post_buffer(image_url, caption, channel_id, platform):
       }
     }
     """
-    metadata = {}
     if platform == "facebook":
         metadata = {"facebook": {"type": "post"}}
     elif platform == "instagram":
         metadata = {"instagram": {"type": "post", "shouldShareToFeed": True}}
-    elif platform == "linkedin":
-        metadata = {}  # LinkedIn doesn't need metadata type
+    else:
+        metadata = {}
+
+    assets = [{"image": {"url": u}} for u in image_urls]
 
     variables = {
         "input": {
@@ -477,181 +561,297 @@ def post_buffer(image_url, caption, channel_id, platform):
             "text": caption,
             "schedulingType": "automatic",
             "mode": "addToQueue",
-            "assets": [{"image": {"url": image_url}}],
+            "assets": assets,
             "metadata": metadata
         }
     }
     resp = requests.post(
         "https://api.buffer.com/graphql",
         json={"query": query, "variables": variables},
-        headers={"Authorization": f"Bearer {BUFFER_TOKEN}", "Content-Type": "application/json"}
+        headers={"Authorization": f"Bearer {BUFFER_TOKEN}", "Content-Type": "application/json"},
+        timeout=60
     )
     return resp.json()
 
-def publish_post(image_url, caption):
+def publish_post(image_urls, caption):
     results = {}
     print("  Posting Facebook...")
-    results["facebook"] = post_buffer(image_url, caption, BUFFER_FB_CHANNEL, "facebook")
+    results["facebook"]  = post_buffer(image_urls, caption, BUFFER_FB_CHANNEL, "facebook")
     print("  Posting Instagram...")
-    results["instagram"] = post_buffer(image_url, caption, BUFFER_IG_CHANNEL, "instagram")
+    results["instagram"] = post_buffer(image_urls, caption, BUFFER_IG_CHANNEL, "instagram")
     print("  Posting LinkedIn...")
-    results["linkedin"] = post_buffer(image_url, caption, BUFFER_LI_CHANNEL, "linkedin")
+    results["linkedin"]  = post_buffer(image_urls, caption, BUFFER_LI_CHANNEL, "linkedin")
     return results
 
-# ── MAIN BOT FLOW ─────────────────────────────────────────
-pending = {}  # post_id -> {topic, content, image_url, caption}
-
-def generate_one_post():
-    topic = pick_topic()
-    print(f"\nTopic: {topic}")
-    print("[1/4] Calling Claude Haiku...")
-    content = generate_content(topic)
-    print(f"[1/4] Done. Title: {content.get('title', '')}")
+# ── POST BUILDERS ─────────────────────────────────────────
+def build_single_post(topic):
+    print(f"\n[single] Topic: {topic}")
+    content = generate_single_content(topic)
+    print(f"[single] Title: {content.get('title','')}")
     caption = f"{content['caption']}\n\n{content['hashtags']}"
-    print("[2/4] Rendering image...")
-    image_bytes, tpl_idx = render_image(content)
-    print("[3/4] Uploading to Cloudinary...")
-    image_url = upload_cloudinary(image_bytes, topic)
-    print(f"[3/4] Done. URL: {image_url}")
-    return {
-        "topic": topic,
-        "content": content,
-        "image_url": image_url,
-        "caption": caption,
-        "template": tpl_idx,
-        "created_at": datetime.now().isoformat()
-    }
+    imgs, tpl_idx = render_single(content)
+    urls = upload_many(imgs, topic)
+    return {"type": "single", "topic": topic, "content": content,
+            "images": urls, "caption": caption, "template": tpl_idx,
+            "created_at": datetime.now(IST).isoformat()}
+
+def build_carousel_post(topic):
+    print(f"\n[carousel] Topic: {topic}")
+    content = generate_carousel_content(topic)
+    print(f"[carousel] Tip: {content.get('tip','')}")
+    caption = f"{content['caption']}\n\n{content['hashtags']}"
+    imgs = render_carousel(content)
+    urls = upload_many(imgs, topic)
+    return {"type": "carousel", "topic": topic, "content": content,
+            "images": urls, "caption": caption,
+            "created_at": datetime.now(IST).isoformat()}
+
+# ── APPROVAL UI ───────────────────────────────────────────
+pending = {}           # post_id -> post dict
+state = {"awaiting": None}  # "carousel_topic"/"single_topic"/("edit",id)/("caption",id)/None
+
+def approval_markup(post_id):
+    return {"inline_keyboard": [
+        [{"text": "✅ Approve & Post", "callback_data": f"approve_{post_id}"},
+         {"text": "❌ Reject", "callback_data": f"reject_{post_id}"}],
+        [{"text": "✏️ Edit Caption", "callback_data": f"edit_{post_id}"},
+         {"text": "🔄 Regenerate", "callback_data": f"regen_{post_id}"}]
+    ]}
 
 def send_for_approval(post_id, post):
     pending[post_id] = post
+    kind = "🖼 SINGLE" if post["type"] == "single" else f"🎠 CAROUSEL ({len(post['images'])} images, 1 tip)"
     preview = (
-        f"📋 <b>Post #{post_id}</b>\n"
-        f"📌 <b>Topic:</b> {post['topic']}\n"
-        f"🎨 <b>Template:</b> {post['template']+1}\n\n"
-        f"📝 <b>Caption:</b>\n{post['caption'][:400]}...\n\n"
+        f"📋 <b>Post #{post_id}</b>  &middot;  {kind}\n"
+        f"📌 <b>Topic:</b> {post['topic']}\n\n"
+        f"📝 <b>Caption:</b>\n{post['caption'][:400]}\n\n"
         f"👇 Tap a button below:"
     )
-    markup = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Approve & Post", "callback_data": f"approve_{post_id}"},
-                {"text": "❌ Reject", "callback_data": f"reject_{post_id}"}
-            ],
-            [
-                {"text": "✏️ Edit Caption", "callback_data": f"edit_{post_id}"},
-                {"text": "🔄 Regenerate", "callback_data": f"regen_{post_id}"}
-            ]
-        ]
-    }
-    tg_send_photo(post['image_url'], preview, markup)
+    if post["type"] == "carousel":
+        tg_send_media_group(post["images"])
+        tg_send(preview, approval_markup(post_id))
+    else:
+        tg_send_photo(post["images"][0], preview, approval_markup(post_id))
 
-def run_one_cycle():
-    tg_send(f"🤖 <b>Generating new post...</b>\n⏰ {datetime.now().strftime('%H:%M %d %b %Y')}")
+def send_awaiting_caption(post_id, post):
+    """Built images, but NO caption yet. Show images, ask Rio for the caption.
+    No Approve button until a caption arrives. No caption = never posted."""
+    post["caption"] = ""
+    post["awaiting_caption"] = True
+    post["_ts"] = time.time()
+    pending[post_id] = post
+    state["awaiting"] = ("caption", post_id)
+    kind = "single" if post["type"] == "single" else "carousel"
+    if post["type"] == "carousel":
+        tg_send_media_group(post["images"])
+    else:
+        tg_send_photo(post["images"][0], f"🖼 Post #{post_id} ({kind}) — images ready.")
+    tg_send(
+        f"✍️ <b>Send the CAPTION for post #{post_id}.</b>\n"
+        f"Topic: {post['topic']}\n\n"
+        f"If you don't send a caption within {MANUAL_CAPTION_EXPIRY_HOURS}h, it will NOT be posted."
+    )
+
+# ── PUBLISH ───────────────────────────────────────────────
+def do_publish(post_id):
+    post = pending.get(post_id)
+    if not post:
+        tg_send(f"⚠️ Post #{post_id} not found (maybe already handled).")
+        return
+    if not post.get("caption", "").strip():
+        tg_send(f"⚠️ Post #{post_id} has no caption yet. Send a caption first.")
+        return
+    tg_send(f"⏳ Publishing post #{post_id} to FB + IG + LinkedIn...")
     try:
-        post = generate_one_post()
-        post_id = int(time.time()) % 100000
-        send_for_approval(post_id, post)
-        tg_send("✅ Post ready! Approve, edit, reject or regenerate above.")
+        results = publish_post(post["images"], post["caption"])
+        tg_send("✅ Sent to Buffer queue for FB / IG / LinkedIn.")
+        save_history({"post_id": post_id, "type": post["type"], "topic": post["topic"],
+                      "caption": post["caption"], "images": post["images"],
+                      "status": "approved", "results": results,
+                      "timestamp": datetime.now(IST).isoformat()})
+        del pending[post_id]
     except Exception as e:
-        tg_send(f"❌ Error generating post: {e}")
-        print(f"Error: {e}")
+        tg_send(f"❌ Publishing failed: {e}")
 
-def handle_callbacks(timeout=10800):
-    """Poll Telegram for button clicks. Timeout = max wait in seconds (3 hours default)"""
-    offset = 0
-    waiting_edit = {}
-    start = time.time()
+# ── CALLBACKS / MESSAGES ──────────────────────────────────
+def handle_callback(cb):
+    data = cb["data"]
+    tg_answer_callback(cb["id"])
 
-    while time.time() - start < timeout:
+    if data.startswith("approve_"):
+        do_publish(int(data.split("_")[1]))
+
+    elif data.startswith("reject_"):
+        post_id = int(data.split("_")[1])
+        if post_id in pending:
+            save_history({"post_id": post_id, "topic": pending[post_id]["topic"],
+                          "status": "rejected", "timestamp": datetime.now(IST).isoformat()})
+            del pending[post_id]
+        tg_send(f"🗑️ Post #{post_id} rejected.")
+
+    elif data.startswith("edit_"):
+        post_id = int(data.split("_")[1])
+        state["awaiting"] = ("edit", post_id)
+        tg_send(f"✏️ Send the new caption for post #{post_id}:")
+
+    elif data.startswith("regen_"):
+        post_id = int(data.split("_")[1])
+        old = pending.get(post_id)
+        if old:
+            tg_send(f"🔄 Regenerating post #{post_id}...")
+            try:
+                if old["type"] == "carousel":
+                    new_post = build_carousel_post(old["topic"])
+                else:
+                    new_post = build_single_post(pick_topic())
+                del pending[post_id]
+                send_for_approval(post_id, new_post)
+            except Exception as e:
+                tg_send(f"❌ Regen failed: {e}")
+
+def handle_message(msg):
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return
+
+    aw = state["awaiting"]
+
+    # Caption for an edit
+    if isinstance(aw, tuple) and aw[0] == "edit":
+        post_id = aw[1]; state["awaiting"] = None
+        if post_id in pending:
+            pending[post_id]["caption"] = text
+            tg_send(f"✏️ Caption updated for post #{post_id}.", approval_markup(post_id))
+        return
+
+    # Manual caption for a built post
+    if isinstance(aw, tuple) and aw[0] == "caption":
+        post_id = aw[1]; state["awaiting"] = None
+        if post_id in pending:
+            pending[post_id]["caption"] = text
+            pending[post_id]["awaiting_caption"] = False
+            tg_send(f"✅ Caption set for post #{post_id}. Approve to publish:", approval_markup(post_id))
+        return
+
+    # Topic for an on-demand carousel
+    if aw == "carousel_topic":
+        state["awaiting"] = None
+        tg_send(f"🎠 Building 1-tip carousel for: <b>{text}</b> ...")
         try:
-            updates = tg_get_updates(offset)
-            for update in updates:
-                offset = update["update_id"] + 1
-
-                if "callback_query" in update:
-                    cb = update["callback_query"]
-                    data = cb["data"]
-                    tg_answer_callback(cb["id"])
-
-                    if data.startswith("approve_"):
-                        post_id = int(data.split("_")[1])
-                        post = pending.get(post_id)
-                        if post:
-                            tg_send(f"⏳ Publishing post #{post_id} to Facebook + Instagram + LinkedIn...")
-                            try:
-                                results = publish_post(post["image_url"], post["caption"])
-                                tg_send(f"✅ Published successfully!\n\nFB: ok\nIG: ok\nLI: ok")
-                                save_history({
-                                    "post_id": post_id,
-                                    "topic": post["topic"],
-                                    "caption": post["caption"],
-                                    "image_url": post["image_url"],
-                                    "status": "approved",
-                                    "results": results,
-                                    "timestamp": datetime.now().isoformat()
-                                })
-                                del pending[post_id]
-                                return  # Done after approve
-                            except Exception as e:
-                                tg_send(f"❌ Publishing failed: {e}")
-
-                    elif data.startswith("reject_"):
-                        post_id = int(data.split("_")[1])
-                        if post_id in pending:
-                            save_history({
-                                "post_id": post_id,
-                                "topic": pending[post_id]["topic"],
-                                "status": "rejected",
-                                "timestamp": datetime.now().isoformat()
-                            })
-                            del pending[post_id]
-                        tg_send(f"🗑️ Post #{post_id} rejected.")
-                        return
-
-                    elif data.startswith("edit_"):
-                        post_id = int(data.split("_")[1])
-                        waiting_edit[post_id] = True
-                        tg_send(f"✏️ Send your new caption for post #{post_id}:")
-
-                    elif data.startswith("regen_"):
-                        post_id = int(data.split("_")[1])
-                        old = pending.get(post_id)
-                        if old:
-                            tg_send(f"🔄 Regenerating post #{post_id}...")
-                            try:
-                                new_post = generate_one_post()
-                                del pending[post_id]
-                                send_for_approval(post_id, new_post)
-                            except Exception as e:
-                                tg_send(f"❌ Regen failed: {e}")
-
-                elif "message" in update:
-                    msg = update["message"]
-                    text = msg.get("text", "")
-                    for post_id in list(waiting_edit.keys()):
-                        if waiting_edit.get(post_id) and pending.get(post_id):
-                            pending[post_id]["caption"] = text
-                            del waiting_edit[post_id]
-                            markup = {"inline_keyboard": [[
-                                {"text": "✅ Approve & Post", "callback_data": f"approve_{post_id}"},
-                                {"text": "❌ Reject", "callback_data": f"reject_{post_id}"}
-                            ]]}
-                            tg_send_photo(pending[post_id]["image_url"],
-                                        f"✏️ Updated caption for post #{post_id}:\n\n{text[:400]}",
-                                        markup)
-                            break
-
-            time.sleep(2)
+            send_for_approval(int(time.time()) % 100000, build_carousel_post(text))
         except Exception as e:
-            print(f"Poll error: {e}")
-            time.sleep(5)
+            tg_send(f"❌ Carousel build failed: {e}")
+        return
 
+    # Topic for an on-demand single
+    if aw == "single_topic":
+        state["awaiting"] = None
+        tg_send(f"🖼 Building single post for: <b>{text}</b> ...")
+        try:
+            send_for_approval(int(time.time()) % 100000, build_single_post(text))
+        except Exception as e:
+            tg_send(f"❌ Build failed: {e}")
+        return
+
+    # Commands
+    cmd = text.lower().split()[0]
+    if cmd in ("/start", "/help"):
+        tg_send(
+            "🤖 <b>Gundrux Bot</b>\n\n"
+            "/post — auto single post (random topic) now\n"
+            "/single — single post on a topic YOU type\n"
+            "/carousel — 5-image, 1-tip carousel on a topic YOU type\n"
+            "/help — this menu\n\n"
+            f"Daily auto: {', '.join(s['time'] for s in SCHEDULE)} IST. "
+            "The 6 PM slot waits for YOUR caption before it can post."
+        )
+    elif cmd == "/post":
+        tg_send("🖼 Generating an auto single post now...")
+        try:
+            send_for_approval(int(time.time()) % 100000, build_single_post(pick_topic()))
+        except Exception as e:
+            tg_send(f"❌ Failed: {e}")
+    elif cmd == "/single":
+        state["awaiting"] = "single_topic"
+        tg_send("🖼 Send me the topic / text for the single post:")
+    elif cmd == "/carousel":
+        state["awaiting"] = "carousel_topic"
+        tg_send("🎠 Send me the topic. I'll make a 5-image carousel built around ONE tip:")
+    else:
+        # Fallback: if a manual-caption post is waiting and state was lost, treat this as its caption.
+        waiting = [pid for pid, p in pending.items() if p.get("awaiting_caption")]
+        if waiting:
+            post_id = sorted(waiting)[-1]
+            pending[post_id]["caption"] = text
+            pending[post_id]["awaiting_caption"] = False
+            tg_send(f"✅ Caption set for post #{post_id}. Approve to publish:", approval_markup(post_id))
+        else:
+            tg_send("Unknown command. Send /help to see options.")
+
+# ── SCHEDULER ─────────────────────────────────────────────
+def fire_slot(slot):
+    t = slot["type"]; manual = slot["manual_caption"]
+    tg_send(f"🤖 <b>Scheduled {t} post</b> &middot; {datetime.now(IST).strftime('%H:%M %d %b')} IST")
+    try:
+        topic = pick_topic()
+        post = build_carousel_post(topic) if t == "carousel" else build_single_post(topic)
+        post_id = int(time.time()) % 100000
+        if manual:
+            send_awaiting_caption(post_id, post)
+        else:
+            send_for_approval(post_id, post)
+    except Exception as e:
+        tg_send(f"❌ Scheduled generation failed: {e}")
+
+def expire_stale_posts():
+    now_ts = time.time()
+    for pid in list(pending.keys()):
+        p = pending[pid]
+        if p.get("awaiting_caption") and now_ts - p.get("_ts", now_ts) > MANUAL_CAPTION_EXPIRY_HOURS * 3600:
+            del pending[pid]
+            if isinstance(state["awaiting"], tuple) and state["awaiting"][1] == pid:
+                state["awaiting"] = None
+            tg_send(f"⌛ Post #{pid} expired — no caption given, so it was NOT posted.")
+
+# ── MAIN LOOP (always-on) ─────────────────────────────────
 def main():
-    print(f"Bot starting at {datetime.now()}")
-    tg_send(f"🚀 <b>Gundrux Bot Active</b>\n⏰ {datetime.now().strftime('%H:%M %d %b %Y')}\n📊 Generating today's post...")
-    run_one_cycle()
-    handle_callbacks(timeout=10800)  # Wait 3 hours for response
-    print("Cycle done.")
+    print(f"Bot starting (always-on) at {datetime.now(IST)} IST")
+    tg_send(
+        f"🚀 <b>Gundrux Bot Online</b>\n"
+        f"⏰ {datetime.now(IST).strftime('%H:%M %d %b %Y')} IST\n"
+        f"📆 Auto: {', '.join(s['time'] for s in SCHEDULE)} IST "
+        f"(6 PM = carousel, you supply the caption)\n"
+        f"Send /help for commands."
+    )
+
+    offset = 0
+    fired_today = {}
+
+    while True:
+        try:
+            for update in tg_get_updates(offset, timeout=10):
+                offset = update["update_id"] + 1
+                if "callback_query" in update:
+                    handle_callback(update["callback_query"])
+                elif "message" in update:
+                    handle_message(update["message"])
+        except Exception as e:
+            print(f"[loop] telegram error: {e}")
+
+        try:
+            now = datetime.now(IST)
+            hhmm = now.strftime("%H:%M")
+            today = now.strftime("%Y-%m-%d")
+            for slot in SCHEDULE:
+                if hhmm == slot["time"] and fired_today.get(slot["time"]) != today:
+                    fired_today[slot["time"]] = today
+                    print(f"[schedule] firing slot {slot['time']} ({slot['type']})")
+                    fire_slot(slot)
+            expire_stale_posts()
+        except Exception as e:
+            print(f"[loop] schedule error: {e}")
+
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
